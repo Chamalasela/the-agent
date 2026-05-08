@@ -10,6 +10,13 @@
 #   * (any other value)    — caller is misusing this script; we still do the
 #                            prepare-and-execute path for safety.
 #
+# Whenever REPOSITORY_URL is set, this script ALWAYS pulls the upstream default
+# branch into the bare clone before any further git action — irrespective of
+# GIT_REF and irrespective of whether the run was triggered by a webhook or by a
+# user-conversational tool. This guarantees that both `git diff origin/<default>`
+# and the no-GIT_REF worktree path see the latest default-branch tip rather than
+# whatever the bare clone happened to be left at by the previous execution.
+#
 # When REPOSITORY_URL is empty we either skip (mode=prepare) or create an empty
 # workspace directory so a no-repo prompt run still has somewhere to cd into.
 set -euo pipefail
@@ -45,6 +52,69 @@ ensure_bare_repo() {
     git -C "${REPO_DIR}" worktree prune >&2 2>/dev/null || true
 }
 
+# Always pull the upstream default branch into the bare clone, even if a GIT_REF
+# was supplied. Why this is non-redundant with the `git fetch --all --prune` in
+# `ensure_bare_repo`:
+#
+#   1. If the upstream renamed its default (e.g. master → main), `--prune`
+#      deletes the old local head but the bare clone's `HEAD` symbolic ref
+#      stays pointed at the now-missing branch — the next `worktree add HEAD`
+#      then dies with "not a valid ref". We re-point HEAD at the live default
+#      so the no-GIT_REF worktree path stays self-healing.
+#
+#   2. The previous fetch is best-effort across *all* refs and `set -e`-aware,
+#      but a partial failure could leave the default branch stale. Re-fetching
+#      it explicitly with `+refs/heads/<default>:refs/heads/<default>` makes
+#      it a hard precondition for any execution that follows.
+#
+#   3. Plugins and free-form prompts routinely diff against `origin/<default>`
+#      (PR reviews, base-branch comparisons, merge-base queries). Guaranteeing
+#      a fresh default-branch tip here means that contract is honoured for both
+#      webhook flows and user-conversational runs without each plugin having
+#      to re-fetch on its own.
+#
+# Failures here are logged but non-fatal: the bare clone is already populated
+# from the earlier fetch/clone, so the run can still proceed against a possibly-
+# slightly-stale default rather than aborting the whole execution.
+pull_default_branch() {
+    log "--- Refreshing default branch from origin ---"
+
+    local symref_line default_ref default_branch
+    if ! symref_line=$(git -C "${REPO_DIR}" ls-remote --symref origin HEAD 2>/dev/null | head -n1); then
+        log "WARNING: ls-remote failed — proceeding with the refs already in the bare clone."
+        return 0
+    fi
+
+    # `ls-remote --symref origin HEAD` first line looks like:
+    #   ref: refs/heads/main	HEAD
+    default_ref="${symref_line%%$'\t'*}"
+    default_ref="${default_ref#ref: }"
+    default_branch="${default_ref#refs/heads/}"
+
+    if [ -z "${default_branch}" ] || [ "${default_branch}" = "${default_ref}" ]; then
+        log "WARNING: could not parse default branch from ls-remote output ('${symref_line}') — skipping refresh."
+        return 0
+    fi
+
+    log "Default branch: ${default_branch}"
+
+    # Force-update the local default-branch ref to match origin. The bare-clone
+    # refspec already does this on `fetch --all`, but re-asserting it with an
+    # explicit `+`-prefixed refspec converts a transient earlier-fetch failure
+    # into a guaranteed up-to-date default branch (or a loud error here).
+    if ! git -C "${REPO_DIR}" fetch origin \
+            "+refs/heads/${default_branch}:refs/heads/${default_branch}" >&2; then
+        log "WARNING: explicit fetch of default branch '${default_branch}' failed — continuing with current refs."
+        return 0
+    fi
+
+    # Re-point local HEAD at the (possibly renamed) default branch so the
+    # no-GIT_REF worktree path picks up the right tip, and so any consumer
+    # reading `HEAD` from the bare clone gets the upstream's view of "default".
+    git -C "${REPO_DIR}" symbolic-ref HEAD "refs/heads/${default_branch}" >&2 \
+        || log "WARNING: failed to re-point HEAD at refs/heads/${default_branch}."
+}
+
 create_worktree() {
     if [ -n "${GIT_REF}" ]; then
         log "--- Creating worktree for ref: ${GIT_REF} ---"
@@ -64,6 +134,12 @@ prepare_empty_workspace() {
 if [ -n "${REPOSITORY_URL}" ]; then
     configure_credentials
     ensure_bare_repo
+    # Refresh the default branch unconditionally — both webhook executions and
+    # user-conversational executions land here, so this single call is what
+    # honours the "always pull the default branch before any git action"
+    # contract for every entry point. Done before create_worktree so the
+    # no-GIT_REF path resolves HEAD to the freshly-refreshed default tip.
+    pull_default_branch
 
     if [ "${XIANIX_MODE}" = "prepare" ]; then
         log "--- Skipping worktree (mode=prepare; bare clone only) ---"
