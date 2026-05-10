@@ -1,7 +1,10 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
+# Pinned to bookworm (Debian 12) on purpose:
+#   * Azure CLI ships a bookworm repo (no trixie dist yet).
+#   * Avoids Debian trixie's `t64` (64-bit time_t) package-rename transition,
+#     which breaks `playwright install --with-deps` on restricted apt mirrors.
 # System deps + Node 20 (npx/MCP) + git + GitHub CLI (gh) + Azure CLI + azure-devops extension (az devops).
-# Azure CLI is installed from Microsoft's bookworm repo (no trixie dist yet); compatible with current slim base.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
@@ -27,7 +30,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && az extension add --name azure-devops --yes \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code
+# Install global Node CLIs: Claude Code + Playwright (lib + CLI driver).
+#   PLAYWRIGHT_BROWSERS_PATH      — shared, non-home browser cache so the
+#                                   non-root xianix user can find browsers
+#                                   at runtime (default is ~/.cache).
+#   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 — at *runtime* (after USER xianix),
+#                                   prevents tools from trying to re-download
+#                                   browsers into the read-only /ms-playwright.
+#   NODE_PATH=/usr/lib/node_modules — lets `require('playwright')` resolve from
+#                                   any CWD; the web-app-tester skill probes
+#                                   the cache and preflights the launch via
+#                                   `node -e "require('playwright')..."` from
+#                                   /workspace, which otherwise hits
+#                                   MODULE_NOT_FOUND for global packages.
+#   @playwright/cli is the playwright-cli driver the skill shells out to and
+#   is intentionally distinct from the `playwright` Node library — both are
+#   installed globally so the non-root user never tries `npm install -g` at
+#   runtime (which would EACCES on /usr/lib/node_modules).
+#   playwright is pinned to match the version the skill uses as a fallback.
+# `playwright install --with-deps` runs apt-get internally to pull Chromium's
+# system libs, so we clean apt lists again afterwards to keep the image lean.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    NODE_PATH=/usr/lib/node_modules
+RUN npm install -g \
+        @anthropic-ai/claude-code \
+        @playwright/cli \
+        playwright@1.49.0 \
+    && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0 playwright install --with-deps chromium \
+    && chmod -R a+rX /ms-playwright \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
 
 WORKDIR /workspace
 
