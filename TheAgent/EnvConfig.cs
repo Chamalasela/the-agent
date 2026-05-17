@@ -10,12 +10,19 @@ public static class EnvConfig
     /// <summary>
     /// Validates that all critical environment variables are present at startup.
     /// Call once after <see cref="Load"/> to fail fast before any work begins.
+    ///
+    /// <c>ANTHROPIC-API-KEY</c> must be present as a host env var for startup to
+    /// succeed. The supervisor subagent additionally consults the rule-set-level
+    /// <c>with-envs</c> entry in the uploaded <c>rules.json</c> on its first chat
+    /// message (see <see cref="Xianix.Rules.StartupEnvResolver.TryResolveValueAsync"/>),
+    /// which can override the host value — but a host fallback must always exist
+    /// so the agent can boot before the knowledge document is available.
     /// </summary>
     /// <exception cref="InvalidOperationException">When one or more required variables are missing.</exception>
     public static void ValidateRequiredVariables()
     {
-        string[] requiredKeys = ["XIANS-SERVER-URL", "XIANS-API-KEY", "ANTHROPIC-API-KEY"];
-        var missing = requiredKeys
+        string[] requiredHostKeys = ["XIANS-SERVER-URL", "XIANS-API-KEY", "ANTHROPIC-API-KEY"];
+        var missing = requiredHostKeys
             .Where(k => string.IsNullOrWhiteSpace(Resolve(k)))
             .ToList();
 
@@ -57,7 +64,13 @@ public static class EnvConfig
     public static string AgentName => Get("AGENT-NAME", Xianix.Constants.AgentName);
 
     // LLM / Anthropic
-    public static string AnthropicApiKey         => GetRequired("ANTHROPIC-API-KEY");
+    // Host env is the authoritative startup default. The supervisor subagent will
+    // additionally consult the rule-set-level `with-envs` entry from the uploaded
+    // rules.json on its first chat message and use that value when present — see
+    // <see cref="Xianix.Rules.StartupEnvResolver"/> and the lazy init in
+    // <see cref="Xianix.Agent.SupervisorSubagent"/>. This property remains the
+    // ground-truth host fallback returned by that resolver.
+    public static string AnthropicApiKey => GetRequired("ANTHROPIC-API-KEY");
     public static string AnthropicDeploymentName => Get("ANTHROPIC-DEPLOYMENT-NAME", "claude-haiku-4-5");
 
     // CM platform tokens (GITHUB-TOKEN, AZURE-DEVOPS-TOKEN, etc.) are NOT read from the host

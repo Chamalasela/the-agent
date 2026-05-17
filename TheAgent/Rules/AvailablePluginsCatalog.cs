@@ -1,6 +1,3 @@
-using System.Text.Json;
-using Xians.Lib.Agents.Core;
-
 namespace Xianix.Rules;
 
 /// <summary>
@@ -45,41 +42,20 @@ internal static class AvailablePluginsCatalog
     /// </summary>
     public const string GitRefInput = "git-ref";
 
-    private static readonly JsonSerializerOptions RulesJsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-    };
-
     /// <summary>
-    /// Loads <c>rules.json</c> from Xians Knowledge and returns one <see cref="CatalogPlugin"/>
-    /// per unique <c>plugin-name@marketplace</c> pair, aggregating every execution block that
-    /// references it so the model can see every way the plugin is normally invoked along with
-    /// the inputs each invocation needs.
+    /// Loads <c>rules.json</c> via the canonical <see cref="RulesKnowledge.LoadAsync"/>
+    /// reader and returns one <see cref="CatalogPlugin"/> per unique
+    /// <c>plugin-name@marketplace</c> pair, aggregating every execution block that
+    /// references it so the model can see every way the plugin is normally invoked
+    /// along with the inputs each invocation needs.
     /// </summary>
     /// <returns>An empty list when the rules knowledge document is missing or unparseable.</returns>
     public static async Task<IReadOnlyList<CatalogPlugin>> LoadAsync()
     {
-        var knowledge = await XiansContext.CurrentAgent.Knowledge
-            .GetAsync(Constants.RulesKnowledgeName)
-            .ConfigureAwait(false);
-
-        if (knowledge is null || string.IsNullOrWhiteSpace(knowledge.Content))
-            return [];
-
-        List<WebhookRuleSet> ruleSets;
-        try
-        {
-            ruleSets = JsonSerializer
-                .Deserialize<List<WebhookRuleSet>>(knowledge.Content, RulesJsonOptions) ?? [];
-        }
-        catch (JsonException)
-        {
-            return [];
-        }
-
-        return BuildCatalog(ruleSets);
+        // Treat "missing" and "empty" identically here — a chat session with no rules
+        // should still get a tool result of "no plugins available" rather than blow up.
+        var ruleSets = await RulesKnowledge.LoadAsync().ConfigureAwait(false);
+        return BuildCatalog(ruleSets ?? []);
     }
 
     /// <summary>

@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using TheAgent;
 using Xianix.Activities;
 using Xianix.Orchestrator;
+using Xianix.Rules;
 using Xianix.Workflows;
 using Xians.Lib.Agents.Core;
 using Xians.Lib.Agents.Knowledge;
@@ -38,8 +39,23 @@ public class XianixAgent(
     {
         var conversationWorkflow = xiansAgent.Workflows.DefineSupervisor();
 
+        // The Anthropic key resolver runs on first chat message — inside the workflow
+        // context, where the canonical rules.json knowledge document is reachable via
+        // XiansContext.CurrentAgent. We prefer a rule-set-level common `with-envs`
+        // declaration for `ANTHROPIC-API-KEY` (same "declare it once at the top of
+        // rules.json" pattern operators use for `GITHUB-TOKEN`) and fall back to the
+        // host env when no entry is declared, the entry uses `secrets.*` (tenant-scoped,
+        // not resolvable for an agent-process credential), or the entry is otherwise
+        // unresolvable. See <see cref="StartupEnvResolver"/> for the full classification.
+        async Task<string> ResolveAnthropicApiKeyAsync()
+        {
+            var resolved = await StartupEnvResolver.TryResolveValueAsync("ANTHROPIC-API-KEY", logger)
+                .ConfigureAwait(false);
+            return resolved ?? EnvConfig.AnthropicApiKey;
+        }
+
         var subagent = new SupervisorSubagent(
-            EnvConfig.AnthropicApiKey,
+            ResolveAnthropicApiKeyAsync,
             EnvConfig.AnthropicDeploymentName,
             supervisorLogger,
             supervisorToolsLogger,

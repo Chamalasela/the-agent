@@ -53,41 +53,90 @@ public sealed class SupervisorSubagent
         "for this attempt. Reply to the user's latest message with at least one short " +
         "sentence of text. Empty output is not acceptable.";
 
-    private readonly AIAgent _agent;
+    /// <summary>
+    /// Resolves the Anthropic API key on first chat message. We can't bind it at
+    /// construction time because the canonical source — the uploaded
+    /// <c>rules.json</c> knowledge document, read via
+    /// <see cref="Xianix.Rules.StartupEnvResolver.TryResolveValueAsync"/> — is only
+    /// reachable from a workflow execution context (i.e. once
+    /// <see cref="Xians.Lib.Agents.Core.XiansContext.CurrentAgent"/> is bound to
+    /// the current chat workflow). Deferring to first message gives us a single
+    /// canonical knowledge source for both the supervisor's API key and every other
+    /// rules-driven credential.
+    /// </summary>
+    private readonly Func<Task<string>> _apiKeyResolver;
     private readonly XiansChatHistoryProvider _historyProvider;
     private readonly ILogger<SupervisorSubagent> _logger;
     private readonly ILogger<SupervisorSubagentTools> _toolsLogger;
     private readonly string _modelName;
 
+    // Lazily constructed on first chat message. AnthropicClient + AIAgent are
+    // immutable after creation, so we cache and reuse them for the lifetime of the
+    // process — matching the original "construct once, reuse forever" contract from
+    // the Microsoft Agent Framework. The SemaphoreSlim guards the double-checked
+    // construction in <see cref="EnsureAgentAsync"/>.
+    private readonly SemaphoreSlim _agentInitLock = new(1, 1);
+    private AIAgent? _agent;
+
     public SupervisorSubagent(
-        string anthropicApiKey,
+        Func<Task<string>> anthropicApiKeyResolver,
         string modelName,
         ILogger<SupervisorSubagent>? logger = null,
         ILogger<SupervisorSubagentTools>? toolsLogger = null,
         ILoggerFactory? loggerFactory = null)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(anthropicApiKey);
+        ArgumentNullException.ThrowIfNull(anthropicApiKeyResolver);
         ArgumentException.ThrowIfNullOrWhiteSpace(modelName);
 
+        _apiKeyResolver = anthropicApiKeyResolver;
         _logger = logger ?? NullLogger<SupervisorSubagent>.Instance;
         _toolsLogger = toolsLogger ?? NullLogger<SupervisorSubagentTools>.Instance;
         _modelName = modelName;
 
-        var client = new AnthropicClient { ApiKey = anthropicApiKey };
         var historyLogger = loggerFactory?.CreateLogger<XiansChatHistoryProvider>();
         _historyProvider = new XiansChatHistoryProvider(historyLogger);
+    }
 
-        // Attach via the framework's first-class ChatHistoryProvider slot (per
-        // Microsoft Agent Framework "Storage" docs). The base class's
-        // InvokingCoreAsync prepends the messages our provider returns before
-        // the caller-supplied request messages, guaranteeing the new user input
-        // is always the last entry sent to the model.
-        _agent = client.AsAIAgent(new ChatClientAgentOptions
+    /// <summary>
+    /// Double-checked lazy construction of the underlying <see cref="AIAgent"/>.
+    /// Called from <see cref="RunAsync"/> so the API key is resolved inside the
+    /// chat workflow context (where the rules knowledge document is readable).
+    /// </summary>
+    private async Task<AIAgent> EnsureAgentAsync(CancellationToken cancellationToken)
+    {
+        if (_agent is not null) return _agent;
+
+        await _agentInitLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            Name = "SupervisorSubagent",
-            ChatOptions = new ChatOptions { ModelId = modelName },
-            ChatHistoryProvider = _historyProvider,
-        });
+            if (_agent is not null) return _agent;
+
+            var apiKey = await _apiKeyResolver().ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(apiKey))
+                throw new InvalidOperationException(
+                    "Anthropic API key resolver returned an empty value. The supervisor " +
+                    "subagent cannot reach Claude without an API key — check the host env " +
+                    "and the rule-set-level 'ANTHROPIC-API-KEY' entry in rules.json.");
+
+            var client = new AnthropicClient { ApiKey = apiKey };
+
+            // Attach via the framework's first-class ChatHistoryProvider slot (per
+            // Microsoft Agent Framework "Storage" docs). The base class's
+            // InvokingCoreAsync prepends the messages our provider returns before
+            // the caller-supplied request messages, guaranteeing the new user input
+            // is always the last entry sent to the model.
+            _agent = client.AsAIAgent(new ChatClientAgentOptions
+            {
+                Name = "SupervisorSubagent",
+                ChatOptions = new ChatOptions { ModelId = _modelName },
+                ChatHistoryProvider = _historyProvider,
+            });
+            return _agent;
+        }
+        finally
+        {
+            _agentInitLock.Release();
+        }
     }
 
     public async Task<string> RunAsync(UserMessageContext context, CancellationToken cancellationToken = default)
@@ -96,6 +145,11 @@ public sealed class SupervisorSubagent
 
         if (string.IsNullOrWhiteSpace(context.Message.Text))
             return "I didn't receive any message. Please send a message.";
+
+        // Resolve the agent (and its API key) lazily inside the workflow context so
+        // the rules.json knowledge document is reachable. After the first call the
+        // cached AIAgent is reused for every subsequent message.
+        var agent = await EnsureAgentAsync(cancellationToken).ConfigureAwait(false);
 
         var baseInstructions = await GetSystemPromptAsync().ConfigureAwait(false);
         var tools = new SupervisorSubagentTools(context, _toolsLogger);
@@ -121,7 +175,7 @@ public sealed class SupervisorSubagent
             cancellationToken.ThrowIfCancellationRequested();
             var attempt = attempts[i];
 
-            var session = await _agent.CreateSessionAsync(cancellationToken).ConfigureAwait(false);
+            var session = await agent.CreateSessionAsync(cancellationToken).ConfigureAwait(false);
             if (attempt.IncludeHistory)
                 _historyProvider.PrimeSession(session, context);
             // else: leaving the session unprimed makes ProvideChatHistoryAsync return an
@@ -140,7 +194,7 @@ public sealed class SupervisorSubagent
                 ],
             });
 
-            lastResponse = await _agent
+            lastResponse = await agent
                 .RunAsync(context.Message.Text, session, runOptions, cancellationToken)
                 .ConfigureAwait(false);
 

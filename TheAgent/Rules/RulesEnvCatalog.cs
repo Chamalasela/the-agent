@@ -1,6 +1,3 @@
-using System.Text.Json;
-using Xians.Lib.Agents.Core;
-
 namespace Xianix.Rules;
 
 /// <summary>
@@ -34,18 +31,11 @@ namespace Xianix.Rules;
 /// </summary>
 internal static class RulesEnvCatalog
 {
-    private static readonly JsonSerializerOptions RulesJsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-    };
-
     /// <summary>
-    /// Loads <c>rules.json</c> from Xians Knowledge and returns one <see cref="EnvEntry"/>
-    /// per unique env name across every execution whose
-    /// <see cref="WebhookExecution.Platform"/> matches <paramref name="platform"/>
-    /// (case-insensitive) or whose platform is unspecified.
+    /// Loads <c>rules.json</c> via the canonical <see cref="RulesKnowledge.LoadAsync"/>
+    /// reader and returns one <see cref="EnvEntry"/> per unique env name across every
+    /// execution whose <see cref="WebhookExecution.Platform"/> matches
+    /// <paramref name="platform"/> (case-insensitive) or whose platform is unspecified.
     ///
     /// Returns an empty list when the rules document is missing or unparseable —
     /// the caller still merges in the platform-required credential envs so the basic
@@ -55,25 +45,8 @@ internal static class RulesEnvCatalog
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(platform);
 
-        var knowledge = await XiansContext.CurrentAgent.Knowledge
-            .GetAsync(Constants.RulesKnowledgeName)
-            .ConfigureAwait(false);
-
-        if (knowledge is null || string.IsNullOrWhiteSpace(knowledge.Content))
-            return [];
-
-        List<WebhookRuleSet> ruleSets;
-        try
-        {
-            ruleSets = JsonSerializer
-                .Deserialize<List<WebhookRuleSet>>(knowledge.Content, RulesJsonOptions) ?? [];
-        }
-        catch (JsonException)
-        {
-            return [];
-        }
-
-        return BuildEnvList(ruleSets, platform);
+        var ruleSets = await RulesKnowledge.LoadAsync().ConfigureAwait(false);
+        return BuildEnvList(ruleSets ?? [], platform);
     }
 
     /// <summary>

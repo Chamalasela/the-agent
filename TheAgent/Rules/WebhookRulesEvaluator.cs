@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
-using Xians.Lib.Agents.Core;
 
 namespace Xianix.Rules;
 
@@ -16,12 +15,9 @@ public sealed class WebhookRulesEvaluator : IWebhookRulesEvaluator
 {
     private readonly ILogger<WebhookRulesEvaluator> _logger;
 
-    private static readonly JsonSerializerOptions RulesJsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-    };
+    // Deserialisation options are shared with every other rules-consumer via
+    // <see cref="RulesKnowledge.RulesJsonOptions"/> so behaviour cannot drift.
+    private static JsonSerializerOptions RulesJsonOptions => RulesKnowledge.RulesJsonOptions;
 
     private static readonly JsonSerializerOptions RulesDumpJsonOptions = new()
     {
@@ -64,15 +60,13 @@ public sealed class WebhookRulesEvaluator : IWebhookRulesEvaluator
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(webhookName);
 
-        var rulesKnowledge = await XiansContext.CurrentAgent.Knowledge.GetAsync(Constants.RulesKnowledgeName);
-        if (rulesKnowledge == null)
-        {
-            _logger.LogError("Rules knowledge document '{RulesName}' is missing — cannot evaluate webhooks.",
-                Constants.RulesKnowledgeName);
+        // Single hop through the canonical reader. `null` means "no document at all"
+        // — historically this method treats that as a hard failure (deployment problem),
+        // since it implies the agent was started without its rules being uploaded.
+        var ruleSets = await RulesKnowledge.LoadAsync(_logger).ConfigureAwait(false);
+        if (ruleSets is null)
             throw new InvalidOperationException("No rules knowledge document found.");
-        }
 
-        var ruleSets = ParseRules(rulesKnowledge.Content);
         return EvaluateCore(webhookName, payload, ruleSets);
     }
 
