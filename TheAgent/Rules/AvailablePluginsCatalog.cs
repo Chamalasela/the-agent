@@ -95,6 +95,10 @@ internal static class AvailablePluginsCatalog
 
         foreach (var set in ruleSets)
         {
+            // Rule-set-wide common envs apply to every execution in this rule set, so a
+            // plugin used by any execution in this rule set may need them. Pass them
+            // through to AddUsage so they accumulate into the plugin's RequiredEnvs
+            // alongside the execution-level envs (still deduped first-wins by env name).
             foreach (var execution in set.Executions)
             {
                 foreach (var plugin in execution.Plugins)
@@ -108,7 +112,7 @@ internal static class AvailablePluginsCatalog
                         builder = new CatalogPluginBuilder(plugin);
                         byKey[key] = builder;
                     }
-                    builder.AddUsage(execution);
+                    builder.AddUsage(execution, set.WithEnvs);
                 }
             }
         }
@@ -188,8 +192,10 @@ internal static class AvailablePluginsCatalog
             _source = source;
         }
 
-        public void AddUsage(WebhookExecution execution)
+        public void AddUsage(WebhookExecution execution, IReadOnlyList<EnvEntry> ruleSetCommonEnvs)
         {
+            ArgumentNullException.ThrowIfNull(ruleSetCommonEnvs);
+
             var inputs = new List<CatalogInputRequirement>();
 
             // Synthesise structural execution context as catalog inputs so the chat-side
@@ -247,6 +253,16 @@ internal static class AvailablePluginsCatalog
                 ExecutionName: execution.Name?.Trim() ?? "",
                 ExecutePrompt: execution.Prompt?.Trim() ?? "",
                 Inputs:        inputs));
+
+            // Rule-set common envs first (so an execution-level entry with the same name
+            // would still win on first-wins dedup if it were added before this rule-set's
+            // common entries on a prior pass — kept consistent with the merge order in
+            // WebhookRulesEvaluator.MergeWithEnvs at evaluation time).
+            foreach (var env in ruleSetCommonEnvs)
+            {
+                if (string.IsNullOrWhiteSpace(env.Name)) continue;
+                _envs.TryAdd(env.Name, env);
+            }
 
             foreach (var env in execution.WithEnvs)
             {

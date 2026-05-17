@@ -209,9 +209,21 @@ public sealed class WebhookRulesEvaluator : IWebhookRulesEvaluator
             var prompt = InterpolatePrompt(execution.Prompt, dict);
             var hasPrompt = !string.IsNullOrWhiteSpace(prompt);
             var blockName = string.IsNullOrWhiteSpace(execution.Name) ? null : execution.Name.Trim();
+
+            // Merge rule-set common envs with the execution's own envs. Execution-level
+            // entries win on name collisions — same "common defaults, executions may
+            // override" contract you'd expect from any inheritance scheme. We dedup here
+            // (rather than letting the container's later sequential pass do it) so the
+            // emitted list has no duplicate names: that keeps mandatory-flag semantics
+            // unambiguous (a rule-set mandatory entry overridden by an execution non-mandatory
+            // entry shouldn't still trip the missing-mandatory check) and produces cleaner
+            // env-provenance logs in ContainerActivities.
+            var mergedEnvs = MergeWithEnvs(set.WithEnvs, execution.WithEnvs);
+
             _logger.LogInformation(
-                "Rules matched execution '{ExecutionBlock}' for webhook '{WebhookName}': {InputCount} input(s), {PluginCount} plugin(s), {WithEnvsCount} with-envs entry/entries, platform='{Platform}', repo='{RepoName}', gitRef='{GitRef}', executePrompt={HasPrompt}.",
-                blockName ?? "(unnamed)", webhookName, dict.Count, execution.Plugins.Count, execution.WithEnvs.Count,
+                "Rules matched execution '{ExecutionBlock}' for webhook '{WebhookName}': {InputCount} input(s), {PluginCount} plugin(s), {WithEnvsCount} with-envs entry/entries (ruleSetCommon={CommonEnvCount}, executionOwn={OwnEnvCount}), platform='{Platform}', repo='{RepoName}', gitRef='{GitRef}', executePrompt={HasPrompt}.",
+                blockName ?? "(unnamed)", webhookName, dict.Count, execution.Plugins.Count, mergedEnvs.Count,
+                set.WithEnvs.Count, execution.WithEnvs.Count,
                 platform.Length == 0 ? "(none)" : platform,
                 string.IsNullOrEmpty(repoName) ? (string.IsNullOrEmpty(repoUrl) ? "(none)" : repoUrl) : repoName,
                 string.IsNullOrEmpty(gitRef) ? "(none)" : gitRef,
@@ -221,7 +233,7 @@ public sealed class WebhookRulesEvaluator : IWebhookRulesEvaluator
                 Plugins:              execution.Plugins,
                 Prompt:               prompt,
                 ExecutionBlockName:   blockName,
-                WithEnvs:             execution.WithEnvs,
+                WithEnvs:             mergedEnvs,
                 Platform:             platform,
                 RepositoryUrl:        repoUrl,
                 RepositoryName:       repoName,
@@ -577,6 +589,45 @@ public sealed class WebhookRulesEvaluator : IWebhookRulesEvaluator
             return ("", diagnosticName);
 
         return (resolved, null);
+    }
+
+    /// <summary>
+    /// Merges rule-set-wide common <c>with-envs</c> with an execution's own <c>with-envs</c>.
+    /// Execution-level entries override rule-set-level entries by <see cref="EnvEntry.Name"/>
+    /// — the same "common defaults, executions may override" contract familiar from class
+    /// inheritance. Entries with a blank <see cref="EnvEntry.Name"/> are dropped (mirrors
+    /// the empty-name skip in <see cref="ContainerActivities.InjectExecutionEnvVarsAsync"/>
+    /// and the catalog builders), and the rule-set entry is kept only when no execution
+    /// entry of the same name exists. The execution-level list is appended in declaration
+    /// order after the surviving rule-set entries so the emitted ordering is "shared defaults
+    /// first, per-execution last" — which is the order an operator scanning the logs would
+    /// expect.
+    /// </summary>
+    private static List<EnvEntry> MergeWithEnvs(
+        IReadOnlyList<EnvEntry> ruleSetEnvs,
+        IReadOnlyList<EnvEntry> executionEnvs)
+    {
+        var executionNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var env in executionEnvs)
+        {
+            if (!string.IsNullOrWhiteSpace(env.Name))
+                executionNames.Add(env.Name);
+        }
+
+        var merged = new List<EnvEntry>(ruleSetEnvs.Count + executionEnvs.Count);
+        foreach (var env in ruleSetEnvs)
+        {
+            if (string.IsNullOrWhiteSpace(env.Name)) continue;
+            if (executionNames.Contains(env.Name)) continue;
+            merged.Add(env);
+        }
+        foreach (var env in executionEnvs)
+        {
+            if (string.IsNullOrWhiteSpace(env.Name)) continue;
+            merged.Add(env);
+        }
+
+        return merged;
     }
 
     /// <summary>

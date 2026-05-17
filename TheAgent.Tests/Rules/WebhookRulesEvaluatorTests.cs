@@ -1164,4 +1164,181 @@ public class WebhookRulesEvaluatorTests
         Assert.Single(outcome.Results!);
         Assert.Equal("opened", outcome.Results![0].Inputs["action"]);
     }
+
+    // ── Rule-set-level common `with-envs` (executions may override) ──────────
+
+    /// <summary>
+    /// A rule-set-wide <c>with-envs</c> entry must flow through to every matched execution
+    /// as if it had been declared inline — that's the whole point of common envs. The
+    /// merged list also keeps a stable "common first" order so an operator scanning the
+    /// env-provenance log sees inherited defaults before per-execution overrides.
+    /// </summary>
+    [Fact]
+    public void EvaluateWithRules_RuleSetCommonWithEnvs_InjectedIntoEveryMatchedExecution()
+    {
+        using var doc = JsonDocument.Parse("""{ "action": "opened" }""");
+        var ruleSets = _sut.ParseRules(
+            """
+            [
+              {
+                "webhook": "Default",
+                "with-envs": [
+                  { "name": "GITHUB-TOKEN", "value": "secrets.GITHUB-TOKEN", "mandatory": true }
+                ],
+                "executions": [
+                  {
+                    "name": "block-a",
+                    "match-any": [ { "rule": "action==opened" } ],
+                    "use-plugins": [],
+                    "execute-prompt": "a"
+                  },
+                  {
+                    "name": "block-b",
+                    "match-any": [ { "rule": "action==opened" } ],
+                    "use-plugins": [],
+                    "execute-prompt": "b"
+                  }
+                ]
+              }
+            ]
+            """);
+
+        var outcome = _sut.EvaluateWithRules("Default", doc.RootElement, ruleSets);
+
+        Assert.True(outcome.Matched);
+        Assert.Equal(2, outcome.Results!.Count);
+        foreach (var result in outcome.Results!)
+        {
+            var envs = result.WithEnvs!;
+            var token = Assert.Single(envs);
+            Assert.Equal("GITHUB-TOKEN", token.Name);
+            Assert.Equal("secrets.GITHUB-TOKEN", token.Value);
+            Assert.True(token.Mandatory);
+        }
+    }
+
+    /// <summary>
+    /// When both levels declare the same env name, the execution-level entry wins —
+    /// matches the "common defaults, executions may override" contract the docs promise
+    /// and keeps a rule-set <c>mandatory: true</c> from sticking around after an execution
+    /// has explicitly redeclared the env (which would otherwise trip the missing-mandatory
+    /// check in the container even though the override resolves fine).
+    /// </summary>
+    [Fact]
+    public void EvaluateWithRules_ExecutionWithEnvs_OverridesRuleSetCommonByName()
+    {
+        using var doc = JsonDocument.Parse("""{ "action": "opened" }""");
+        var ruleSets = _sut.ParseRules(
+            """
+            [
+              {
+                "webhook": "Default",
+                "with-envs": [
+                  { "name": "GITHUB-TOKEN", "value": "secrets.GITHUB-TOKEN", "mandatory": true }
+                ],
+                "executions": [
+                  {
+                    "name": "override-block",
+                    "match-any": [ { "rule": "action==opened" } ],
+                    "use-plugins": [],
+                    "with-envs": [
+                      { "name": "GITHUB-TOKEN", "value": "secrets.LEGACY-TOKEN" }
+                    ],
+                    "execute-prompt": "ok"
+                  }
+                ]
+              }
+            ]
+            """);
+
+        var outcome = _sut.EvaluateWithRules("Default", doc.RootElement, ruleSets);
+
+        Assert.True(outcome.Matched);
+        var envs = outcome.Results![0].WithEnvs!;
+        var token = Assert.Single(envs);
+        Assert.Equal("GITHUB-TOKEN", token.Name);
+        Assert.Equal("secrets.LEGACY-TOKEN", token.Value);
+        Assert.False(token.Mandatory);
+    }
+
+    /// <summary>
+    /// Common and execution envs with different names should both be emitted, with the
+    /// rule-set entry first (the "common defaults first" ordering convention).
+    /// </summary>
+    [Fact]
+    public void EvaluateWithRules_RuleSetAndExecutionWithEnvs_BothEmittedWhenNamesDiffer()
+    {
+        using var doc = JsonDocument.Parse("""{ "action": "opened" }""");
+        var ruleSets = _sut.ParseRules(
+            """
+            [
+              {
+                "webhook": "Default",
+                "with-envs": [
+                  { "name": "GITHUB-TOKEN", "value": "secrets.GITHUB-TOKEN", "mandatory": true }
+                ],
+                "executions": [
+                  {
+                    "name": "ado-block",
+                    "match-any": [ { "rule": "action==opened" } ],
+                    "use-plugins": [],
+                    "with-envs": [
+                      { "name": "AZURE-DEVOPS-TOKEN", "value": "secrets.AZURE-DEVOPS-TOKEN", "mandatory": true }
+                    ],
+                    "execute-prompt": "ok"
+                  }
+                ]
+              }
+            ]
+            """);
+
+        var outcome = _sut.EvaluateWithRules("Default", doc.RootElement, ruleSets);
+
+        Assert.True(outcome.Matched);
+        var envs = outcome.Results![0].WithEnvs!;
+        Assert.Equal(2, envs.Count);
+        Assert.Equal("GITHUB-TOKEN",       envs[0].Name);
+        Assert.Equal("AZURE-DEVOPS-TOKEN", envs[1].Name);
+    }
+
+    /// <summary>
+    /// Empty-name entries on either level are silently dropped (same policy as the
+    /// catalog builders and the container env injector), so a typo'd entry won't show
+    /// up in the merged list.
+    /// </summary>
+    [Fact]
+    public void EvaluateWithRules_BlankEnvNamesAreDropped()
+    {
+        using var doc = JsonDocument.Parse("""{ "action": "opened" }""");
+        var ruleSets = _sut.ParseRules(
+            """
+            [
+              {
+                "webhook": "Default",
+                "with-envs": [
+                  { "name": "",             "value": "secrets.X" },
+                  { "name": "GITHUB-TOKEN", "value": "secrets.GITHUB-TOKEN", "mandatory": true }
+                ],
+                "executions": [
+                  {
+                    "name": "block",
+                    "match-any": [ { "rule": "action==opened" } ],
+                    "use-plugins": [],
+                    "with-envs": [
+                      { "name": "",                  "value": "secrets.Y" },
+                      { "name": "AZURE-DEVOPS-TOKEN","value": "secrets.AZURE-DEVOPS-TOKEN" }
+                    ],
+                    "execute-prompt": "ok"
+                  }
+                ]
+              }
+            ]
+            """);
+
+        var outcome = _sut.EvaluateWithRules("Default", doc.RootElement, ruleSets);
+
+        Assert.True(outcome.Matched);
+        var names = outcome.Results![0].WithEnvs!.Select(e => e.Name).ToArray();
+        Assert.Equal(new[] { "GITHUB-TOKEN", "AZURE-DEVOPS-TOKEN" }, names);
+    }
 }

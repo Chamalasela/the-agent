@@ -8,6 +8,21 @@ public sealed class WebhookRuleSet
     [JsonPropertyName("webhook")]
     public string WebhookName { get; init; } = "";
 
+    /// <summary>
+    /// Rule-set-wide common environment variables that apply to <em>every</em> execution
+    /// in this rule set. Use these for credentials or settings every execution shares
+    /// (e.g. a <c>GITHUB-TOKEN</c> consumed by every GitHub-driven execution) so the same
+    /// declaration doesn't have to be repeated on each <see cref="WebhookExecution.WithEnvs"/>.
+    /// Each execution's own <see cref="WebhookExecution.WithEnvs"/> takes precedence by env
+    /// name — if an execution declares an env with the same <see cref="EnvEntry.Name"/>,
+    /// the execution-level entry wins and the rule-set-level entry is dropped for that
+    /// execution. Every entry must use one of the same three explicit forms as the
+    /// execution-level list (<c>host.*</c>, <c>secrets.*</c>, or <c>constant: true</c>);
+    /// bare names are rejected at container-start time.
+    /// </summary>
+    [JsonPropertyName("with-envs")]
+    public List<EnvEntry> WithEnvs { get; init; } = [];
+
     [JsonPropertyName("executions")]
     public List<WebhookExecution> Executions { get; init; } = [];
 }

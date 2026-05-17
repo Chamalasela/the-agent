@@ -300,6 +300,13 @@ public sealed class SupervisorSubagentTools(UserMessageContext context, ILogger<
         // needed secret) would only get the platform PAT and would fail the moment Claude
         // Code reached for any other tenant credential.
         //
+        // `RulesEnvCatalog.LoadEnvsForPlatformAsync` returns both the rule-set-wide
+        // common envs (`WebhookRuleSet.WithEnvs` — applied to every execution by design,
+        // so always included regardless of platform) AND the per-execution envs that
+        // match the requested platform (or are platform-agnostic). That keeps the chat
+        // path symmetric with the webhook merge in WebhookRulesEvaluator: anything
+        // declared as a rule-set common shows up here too.
+        //
         // The platform filter is preserved so a single-platform run never inherits the
         // *other* platform's mandatory PATs and trips the missing-secret fail-fast in
         // ContainerActivities.InjectExecutionEnvVarsAsync. The platform-required
