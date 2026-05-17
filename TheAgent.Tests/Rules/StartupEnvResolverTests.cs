@@ -8,9 +8,13 @@ namespace TheAgent.Tests.Rules;
 /// Unit tests for <see cref="StartupEnvResolver.TryResolveFromRuleSets"/> — the pure,
 /// in-memory part of the agent-startup env resolver. The knowledge-fetching entry
 /// point (<see cref="StartupEnvResolver.TryResolveValueAsync"/>) reads from Xians
-/// Knowledge via <see cref="RulesKnowledge.LoadAsync"/>, which is integration-tested
-/// at runtime when the supervisor subagent handles its first chat message; this class
-/// exercises the resolution rules in isolation so they can't silently regress.
+/// Knowledge via <see cref="RulesKnowledge.LoadAsync"/> and resolves
+/// <c>secrets.*</c> entries against the tenant-scoped Xians Secret Vault — both
+/// require a live <see cref="Xians.Lib.Agents.Core.XiansContext"/>, which only
+/// exists inside a workflow execution. End-to-end coverage for that path lives
+/// with the supervisor subagent's first-message-per-tenant flow; this class
+/// exercises the constant / host-env branches in isolation so they can't silently
+/// regress.
 ///
 /// The resolver only looks at <see cref="WebhookRuleSet.WithEnvs"/> (the rule-set-wide
 /// common envs) — execution-level envs are intentionally out of scope for agent-process
@@ -90,13 +94,18 @@ public class StartupEnvResolverTests
     }
 
     /// <summary>
-    /// <c>secrets.*</c> requires the Xians tenant-scoped Secret Vault, which doesn't
-    /// exist at agent startup (no tenant context). The resolver must therefore return
-    /// <c>null</c> so the caller falls back to its host-env default — silently using a
-    /// per-tenant secret as a process-wide credential would be incorrect.
+    /// In production, <c>secrets.*</c> entries are resolved by
+    /// <see cref="StartupEnvResolver.TryResolveValueAsync"/> against the tenant-scoped
+    /// Xians Secret Vault (the supervisor caches one AIAgent per tenant so a per-tenant
+    /// secret is a valid agent-process credential). The pure
+    /// <see cref="StartupEnvResolver.TryResolveFromRuleSets"/> helper deliberately
+    /// returns <c>null</c> for that branch because vault access requires a live
+    /// <see cref="Xians.Lib.Agents.Core.XiansContext"/> that unit tests don't have.
+    /// This test pins that behaviour so a future refactor can't accidentally make the
+    /// sync helper attempt a vault call and crash on the missing context.
     /// </summary>
     [Fact]
-    public void TryResolveFromRuleSets_SecretReference_ReturnsNullAtStartup()
+    public void TryResolveFromRuleSets_SecretReference_ReturnsNullInSyncHelper()
     {
         var rules = new[]
         {
@@ -223,8 +232,9 @@ public class StartupEnvResolverTests
     }
 
     // Integration tests that hit the live <see cref="RulesKnowledge.LoadAsync"/>
-    // reader are intentionally out of scope here: that path requires an active
-    // <see cref="Xians.Lib.Agents.Core.XiansContext"/>, which only exists inside a
-    // workflow execution. End-to-end coverage of the lazy lookup lives with the
-    // supervisor subagent's first-message flow.
+    // reader OR the per-tenant Xians Secret Vault are intentionally out of scope here:
+    // both paths require an active <see cref="Xians.Lib.Agents.Core.XiansContext"/>,
+    // which only exists inside a workflow execution. End-to-end coverage of the lazy
+    // lookup and of `secrets.*` resolution per tenant lives with the supervisor
+    // subagent's first-message-per-tenant flow.
 }

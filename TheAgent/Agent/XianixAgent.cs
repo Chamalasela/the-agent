@@ -39,14 +39,24 @@ public class XianixAgent(
     {
         var conversationWorkflow = xiansAgent.Workflows.DefineSupervisor();
 
-        // The Anthropic key resolver runs on first chat message — inside the workflow
-        // context, where the canonical rules.json knowledge document is reachable via
-        // XiansContext.CurrentAgent. We prefer a rule-set-level common `with-envs`
-        // declaration for `ANTHROPIC-API-KEY` (same "declare it once at the top of
-        // rules.json" pattern operators use for `GITHUB-TOKEN`) and fall back to the
-        // host env when no entry is declared, the entry uses `secrets.*` (tenant-scoped,
-        // not resolvable for an agent-process credential), or the entry is otherwise
-        // unresolvable. See <see cref="StartupEnvResolver"/> for the full classification.
+        // The Anthropic key resolver runs on the supervisor's first message per
+        // tenant (SupervisorSubagent caches one AIAgent per TenantId; see
+        // EnsureAgentForTenantAsync there). At that point XiansContext.CurrentAgent
+        // is bound to the calling message's tenant — the platform scopes it via
+        // AsyncLocal — so all of the resolver's reads happen against the right
+        // tenant: rules.json comes from XiansContext.CurrentAgent.Knowledge and any
+        // `secrets.*` entry is fetched from XiansContext.CurrentAgent.Secrets.TenantScope().
+        //
+        // Resolution order, identical to the container path's `with-envs` merge:
+        //   1. Rule-set-level `with-envs` entry named `ANTHROPIC-API-KEY` in rules.json
+        //      — constant / host.VAR / secrets.KEY all supported. Operators normally
+        //      declare it once at the top of rules.json (same pattern they already
+        //      use for GITHUB-TOKEN).
+        //   2. Host env `ANTHROPIC-API-KEY` (or `ANTHROPIC_API_KEY`) — fallback when
+        //      the rules.json entry is absent, points at an unset host var, or the
+        //      tenant's Secret Vault has no entry under the configured key.
+        //   3. Empty — SupervisorSubagent surfaces a loud, tenant-tagged error which
+        //      OnUserChatMessage's catch logs and replies to the user.
         async Task<string> ResolveAnthropicApiKeyAsync()
         {
             var resolved = await StartupEnvResolver.TryResolveValueAsync("ANTHROPIC-API-KEY", logger)

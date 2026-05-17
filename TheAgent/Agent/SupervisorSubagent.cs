@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Anthropic;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
@@ -54,15 +55,21 @@ public sealed class SupervisorSubagent
         "sentence of text. Empty output is not acceptable.";
 
     /// <summary>
-    /// Resolves the Anthropic API key on first chat message. We can't bind it at
-    /// construction time because the canonical source — the uploaded
-    /// <c>rules.json</c> knowledge document, read via
-    /// <see cref="Xianix.Rules.StartupEnvResolver.TryResolveValueAsync"/> — is only
-    /// reachable from a workflow execution context (i.e. once
-    /// <see cref="Xians.Lib.Agents.Core.XiansContext.CurrentAgent"/> is bound to
-    /// the current chat workflow). Deferring to first message gives us a single
-    /// canonical knowledge source for both the supervisor's API key and every other
-    /// rules-driven credential.
+    /// Resolves the Anthropic API key on the first chat message <em>for each
+    /// tenant</em>. We can't bind it at construction time because the canonical
+    /// source — the uploaded <c>rules.json</c> knowledge document, read via
+    /// <see cref="Xianix.Rules.StartupEnvResolver.TryResolveValueAsync"/>, plus the
+    /// tenant Secret Vault for any <c>secrets.*</c> entries — is only reachable
+    /// from a workflow execution context (i.e. once
+    /// <see cref="XiansContext.CurrentAgent"/> is bound to the
+    /// current chat workflow, which the Xians platform scopes to the active
+    /// tenant via AsyncLocal). Deferring to first message per tenant gives us a
+    /// single canonical knowledge + secrets source per tenant for both the
+    /// supervisor's API key and every other rules-driven credential.
+    ///
+    /// The resolver is parameterless because <c>XiansContext.CurrentAgent</c> is
+    /// already tenant-scoped at the moment it's invoked; the caller doesn't need
+    /// to pass the tenant ID through.
     /// </summary>
     private readonly Func<Task<string>> _apiKeyResolver;
     private readonly XiansChatHistoryProvider _historyProvider;
@@ -70,13 +77,27 @@ public sealed class SupervisorSubagent
     private readonly ILogger<SupervisorSubagentTools> _toolsLogger;
     private readonly string _modelName;
 
-    // Lazily constructed on first chat message. AnthropicClient + AIAgent are
-    // immutable after creation, so we cache and reuse them for the lifetime of the
-    // process — matching the original "construct once, reuse forever" contract from
-    // the Microsoft Agent Framework. The SemaphoreSlim guards the double-checked
-    // construction in <see cref="EnsureAgentAsync"/>.
-    private readonly SemaphoreSlim _agentInitLock = new(1, 1);
-    private AIAgent? _agent;
+    // Per-tenant caches. Each tenant gets its own AIAgent (and underlying
+    // AnthropicClient) because rules.json `with-envs` entries that use
+    // `secrets.ANTHROPIC-API-KEY` resolve against the per-tenant Xians Secret
+    // Vault — so different tenants may legitimately pin different API keys. The
+    // AIAgent itself is immutable after construction, so we cache and reuse it
+    // for the lifetime of the process per tenant, matching the original "construct
+    // once, reuse forever" Microsoft Agent Framework contract scoped per tenant.
+    //
+    // Concurrency model:
+    //   - _agentsByTenant only contains successfully-constructed agents; failed
+    //     construction is NOT cached, so the next message from the same tenant
+    //     retries from scratch (preserving the previous behaviour).
+    //   - _initLocksByTenant gives one SemaphoreSlim per tenant so two messages
+    //     from the same tenant don't race into double-construction, while
+    //     different tenants can initialise concurrently without blocking each
+    //     other (which would otherwise add tail latency proportional to the
+    //     slowest tenant's first-message vault round-trip).
+    private readonly ConcurrentDictionary<string, AIAgent> _agentsByTenant =
+        new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _initLocksByTenant =
+        new(StringComparer.Ordinal);
 
     public SupervisorSubagent(
         Func<Task<string>> anthropicApiKeyResolver,
@@ -98,25 +119,36 @@ public sealed class SupervisorSubagent
     }
 
     /// <summary>
-    /// Double-checked lazy construction of the underlying <see cref="AIAgent"/>.
-    /// Called from <see cref="RunAsync"/> so the API key is resolved inside the
-    /// chat workflow context (where the rules knowledge document is readable).
+    /// Returns the cached <see cref="AIAgent"/> for the given tenant, constructing
+    /// it (and resolving the tenant-scoped Anthropic API key) on first use. The
+    /// resolver runs under the current <see cref="XiansContext.CurrentAgent"/>
+    /// scope — which the platform binds to the calling message's tenant — so it
+    /// transparently reads from the correct tenant's <c>rules.json</c> and Secret
+    /// Vault. See <see cref="_apiKeyResolver"/> for why this is parameterless.
     /// </summary>
-    private async Task<AIAgent> EnsureAgentAsync(CancellationToken cancellationToken)
+    private async Task<AIAgent> EnsureAgentForTenantAsync(
+        string tenantId, CancellationToken cancellationToken)
     {
-        if (_agent is not null) return _agent;
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
 
-        await _agentInitLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (_agentsByTenant.TryGetValue(tenantId, out var cached))
+            return cached;
+
+        var initLock = _initLocksByTenant.GetOrAdd(tenantId, _ => new SemaphoreSlim(1, 1));
+        await initLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (_agent is not null) return _agent;
+            if (_agentsByTenant.TryGetValue(tenantId, out cached))
+                return cached;
 
             var apiKey = await _apiKeyResolver().ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(apiKey))
                 throw new InvalidOperationException(
-                    "Anthropic API key resolver returned an empty value. The supervisor " +
-                    "subagent cannot reach Claude without an API key — check the host env " +
-                    "and the rule-set-level 'ANTHROPIC-API-KEY' entry in rules.json.");
+                    $"Anthropic API key resolver returned an empty value for tenant " +
+                    $"'{tenantId}'. The supervisor subagent cannot reach Claude without " +
+                    "an API key — check the rule-set-level 'ANTHROPIC-API-KEY' entry in " +
+                    "rules.json (constant / host.VAR / secrets.KEY) and, for secrets.*, " +
+                    "the tenant's Xians Secret Vault, then a host env fallback.");
 
             var client = new AnthropicClient { ApiKey = apiKey };
 
@@ -124,18 +156,25 @@ public sealed class SupervisorSubagent
             // Microsoft Agent Framework "Storage" docs). The base class's
             // InvokingCoreAsync prepends the messages our provider returns before
             // the caller-supplied request messages, guaranteeing the new user input
-            // is always the last entry sent to the model.
-            _agent = client.AsAIAgent(new ChatClientAgentOptions
+            // is always the last entry sent to the model. The provider is stateless
+            // (per-session state lives on AgentSession), so a single instance is
+            // safely shared across every tenant's cached AIAgent.
+            var agent = client.AsAIAgent(new ChatClientAgentOptions
             {
                 Name = "SupervisorSubagent",
                 ChatOptions = new ChatOptions { ModelId = _modelName },
                 ChatHistoryProvider = _historyProvider,
             });
-            return _agent;
+            _agentsByTenant[tenantId] = agent;
+            _logger.LogInformation(
+                "Constructed SupervisorSubagent AIAgent for tenant '{TenantId}' " +
+                "(model={Model}). Cached for subsequent messages.",
+                tenantId, _modelName);
+            return agent;
         }
         finally
         {
-            _agentInitLock.Release();
+            initLock.Release();
         }
     }
 
@@ -147,9 +186,11 @@ public sealed class SupervisorSubagent
             return "I didn't receive any message. Please send a message.";
 
         // Resolve the agent (and its API key) lazily inside the workflow context so
-        // the rules.json knowledge document is reachable. After the first call the
-        // cached AIAgent is reused for every subsequent message.
-        var agent = await EnsureAgentAsync(cancellationToken).ConfigureAwait(false);
+        // the rules.json knowledge document and the tenant's Xians Secret Vault are
+        // both reachable. The cache is keyed by tenant ID — see EnsureAgentForTenantAsync
+        // — so each tenant gets their own AIAgent built against their own credentials.
+        var agent = await EnsureAgentForTenantAsync(
+            context.Message.TenantId, cancellationToken).ConfigureAwait(false);
 
         var baseInstructions = await GetSystemPromptAsync().ConfigureAwait(false);
         var tools = new SupervisorSubagentTools(context, _toolsLogger);
