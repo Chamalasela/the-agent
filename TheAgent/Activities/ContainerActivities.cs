@@ -376,11 +376,18 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
 
     private static async Task<List<string>> BuildEnvVarsAsync(ContainerExecutionInput input)
     {
-        // Only platform-agnostic runtime values + the agent-wide ANTHROPIC-API-KEY are seeded
-        // from the host. CM platform tokens (GITHUB-TOKEN, AZURE-DEVOPS-TOKEN, ...) are
-        // intentionally NOT injected here: tenants must supply their own via the Xians Secret
-        // Vault and reference them from rules.json as `secrets.<KEY>` so that no two tenants
+        // Only platform-agnostic runtime values + (optionally) the agent-wide
+        // ANTHROPIC-API-KEY are seeded from the host. CM platform tokens
+        // (GITHUB-TOKEN, AZURE-DEVOPS-TOKEN, ...) are intentionally NOT injected
+        // here: tenants must supply their own via the Xians Secret Vault and
+        // reference them from rules.json as `secrets.<KEY>` so that no two tenants
         // ever share the same platform credential.
+        //
+        // ANTHROPIC-API-KEY is now optional on the host (see EnvConfig.AnthropicApiKey).
+        // If it isn't set we skip the seed entirely; the rules.json `with-envs` merge
+        // below is then the sole source. InjectExecutionEnvVarsAsync still overrides
+        // any host-seeded value when a rules.json entry exists, preserving the
+        // long-standing "rules.json wins over host defaults" contract.
         var env       = new Dictionary<string, string>(StringComparer.Ordinal);
         var prov      = new Dictionary<string, EnvProvenance>(StringComparer.Ordinal);
         var anthropic = EnvConfig.AnthropicApiKey;
@@ -392,10 +399,13 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
         SetRuntime(env, prov, "CLAUDE-CODE-PLUGINS",  input.ClaudeCodePlugins);
         SetRuntime(env, prov, "PROMPT",               input.Prompt);
 
-        env["ANTHROPIC-API-KEY"]  = anthropic;
-        prov["ANTHROPIC-API-KEY"] = new EnvProvenance(
-            EnvSource.HostEnv, Detail: "ANTHROPIC-API-KEY", Resolved: !string.IsNullOrEmpty(anthropic),
-            Length: anthropic.Length, Mandatory: false, Override: false);
+        if (!string.IsNullOrEmpty(anthropic))
+        {
+            env["ANTHROPIC-API-KEY"]  = anthropic;
+            prov["ANTHROPIC-API-KEY"] = new EnvProvenance(
+                EnvSource.HostEnv, Detail: "ANTHROPIC-API-KEY", Resolved: true,
+                Length: anthropic.Length, Mandatory: false, Override: false);
+        }
 
         await InjectExecutionEnvVarsAsync(input.WithEnvsJson, env, prov, input.TenantId);
 

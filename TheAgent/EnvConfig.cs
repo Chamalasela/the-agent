@@ -11,17 +11,25 @@ public static class EnvConfig
     /// Validates that all critical environment variables are present at startup.
     /// Call once after <see cref="Load"/> to fail fast before any work begins.
     ///
-    /// <c>ANTHROPIC-API-KEY</c> must be present as a host env var for startup to
-    /// succeed. The supervisor subagent additionally consults the rule-set-level
-    /// <c>with-envs</c> entry in the uploaded <c>rules.json</c> on its first chat
-    /// message (see <see cref="Xianix.Rules.StartupEnvResolver.TryResolveValueAsync"/>),
-    /// which can override the host value — but a host fallback must always exist
-    /// so the agent can boot before the knowledge document is available.
+    /// Only the Xians platform credentials are gated here — without them the agent
+    /// cannot even register with the platform or upload its knowledge documents,
+    /// so there is nothing useful it could do.
+    ///
+    /// <c>ANTHROPIC-API-KEY</c> is deliberately <em>not</em> in this list. It is
+    /// resolved lazily on the supervisor's first chat message via
+    /// <see cref="Xianix.Rules.StartupEnvResolver.TryResolveValueAsync"/>, which
+    /// consults the rule-set-level <c>with-envs</c> entry in the uploaded
+    /// <c>rules.json</c> first and falls back to the host env when present. That
+    /// lets operators manage the Anthropic key entirely from <c>rules.json</c> and
+    /// run the agent host without it (e.g. when the secret has been removed from
+    /// Key Vault). The supervisor surfaces a loud, user-visible chat error if no
+    /// source resolves at first message time — see
+    /// <see cref="Xianix.Agent.SupervisorSubagent"/>'s lazy init.
     /// </summary>
     /// <exception cref="InvalidOperationException">When one or more required variables are missing.</exception>
     public static void ValidateRequiredVariables()
     {
-        string[] requiredHostKeys = ["XIANS-SERVER-URL", "XIANS-API-KEY", "ANTHROPIC-API-KEY"];
+        string[] requiredHostKeys = ["XIANS-SERVER-URL", "XIANS-API-KEY"];
         var missing = requiredHostKeys
             .Where(k => string.IsNullOrWhiteSpace(Resolve(k)))
             .ToList();
@@ -64,13 +72,17 @@ public static class EnvConfig
     public static string AgentName => Get("AGENT-NAME", Xianix.Constants.AgentName);
 
     // LLM / Anthropic
-    // Host env is the authoritative startup default. The supervisor subagent will
-    // additionally consult the rule-set-level `with-envs` entry from the uploaded
-    // rules.json on its first chat message and use that value when present — see
-    // <see cref="Xianix.Rules.StartupEnvResolver"/> and the lazy init in
-    // <see cref="Xianix.Agent.SupervisorSubagent"/>. This property remains the
-    // ground-truth host fallback returned by that resolver.
-    public static string AnthropicApiKey => GetRequired("ANTHROPIC-API-KEY");
+    //
+    // Returns the host env value if set, otherwise an empty string. The Anthropic key
+    // is intentionally NOT required at startup — the supervisor subagent consults the
+    // rule-set-level `with-envs` entry from the uploaded rules.json on its first chat
+    // message first (see <see cref="Xianix.Rules.StartupEnvResolver"/> and the lazy
+    // init in <see cref="Xianix.Agent.SupervisorSubagent"/>), and falls back to this
+    // host value only when no rules.json entry resolves. Callers that need a hard
+    // throw on empty (e.g. <see cref="Xianix.Activities.ContainerActivities"/>'s
+    // container seed) must check for an empty string themselves and decide whether
+    // to surface a user-visible error or skip the env entirely.
+    public static string AnthropicApiKey => Get("ANTHROPIC-API-KEY");
     public static string AnthropicDeploymentName => Get("ANTHROPIC-DEPLOYMENT-NAME", "claude-haiku-4-5");
 
     // CM platform tokens (GITHUB-TOKEN, AZURE-DEVOPS-TOKEN, etc.) are NOT read from the host

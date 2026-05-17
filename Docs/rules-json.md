@@ -398,7 +398,7 @@ Both lists are then deduped by env name. The platform filter intentionally does 
 
 ### Resolution precedence
 
-Only `ANTHROPIC-API-KEY` is seeded into the container from the host `.env` (it's also required for the agent process itself). All CM platform credentials — `GITHUB-TOKEN`, `AZURE-DEVOPS-TOKEN`, anything else — are **not** read from the host: each tenant must store their own in the Xians Secret Vault and reference it from `rules.json` via `"value": "secrets.<KEY>"`. `with-envs` entries are layered on top of the host-derived defaults at container-start time, so any `secrets.*` or `host.*` entry in `rules.json` overrides whatever was seeded.
+When the host `.env` (or Key Vault on the deployed VM) declares `ANTHROPIC-API-KEY`, that value is seeded into the executor container as a default. If the host does **not** declare it, no seed is emitted and the container is expected to receive the key from a `with-envs` entry in `rules.json` instead. All CM platform credentials — `GITHUB-TOKEN`, `AZURE-DEVOPS-TOKEN`, anything else — are **not** read from the host: each tenant must store their own in the Xians Secret Vault and reference it from `rules.json` via `"value": "secrets.<KEY>"`. `with-envs` entries are layered on top of the host-derived defaults at container-start time, so any `secrets.*` or `host.*` entry in `rules.json` overrides whatever was seeded.
 
 ### Agent-process credentials (e.g. `ANTHROPIC-API-KEY`)
 
@@ -411,7 +411,7 @@ Some credentials are consumed by the agent process itself, not just the containe
    - `"value": "secrets.SECRET-KEY"` → **skipped** with a warning. The Xians Secret Vault is per-tenant; the agent process is shared, so a tenant-scoped secret cannot stand in for a process credential. Use `host.*` or `constant` for process credentials.
 3. If resolution fails or no entry is declared, the supervisor falls back to the host env var of the same name (`EnvConfig.AnthropicApiKey`).
 
-The host env var must still be set at startup — `EnvConfig.ValidateRequiredVariables()` enforces it so the agent can register with Xians and upload rules before any chat traffic arrives. A rule-set-level `ANTHROPIC-API-KEY` entry in `rules.json` then *overrides* the host value on the first chat message, after which the resolved `AnthropicClient` is cached for the lifetime of the process. The container path also picks up rule-set commons via the normal `with-envs` merge, so the same declaration covers both the supervisor and every executor run.
+The host env var is **optional**. `EnvConfig.ValidateRequiredVariables()` gates only the Xians platform credentials (`XIANS-SERVER-URL`, `XIANS-API-KEY`) so the agent can register and upload knowledge before any chat traffic arrives — Anthropic key absence does not block boot. If neither the rule-set-level entry nor the host env resolves at first-message time, the supervisor raises a clear `Anthropic API key resolver returned an empty value` error which the conversation workflow logs and surfaces to the user as a generic apology; fix it by adding either a rule-set-level `with-envs` entry or a host env value and restarting. When a host value is present, a rule-set-level `ANTHROPIC-API-KEY` entry in `rules.json` *overrides* it on the first chat message, after which the resolved `AnthropicClient` is cached for the lifetime of the process. The container path also picks up rule-set commons via the normal `with-envs` merge, so the same declaration covers both the supervisor and every executor run.
 
 ### Resolving `secrets.*`
 

@@ -8,13 +8,31 @@ using XiansInfraLoggerFactory = Xians.Lib.Common.Infrastructure.LoggerFactory;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
-using var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) =>
+// NOTE: do NOT use `using var` here. The ProcessExit handler below runs on
+// AppDomain unload, which fires AFTER Main exits — and Main exit triggers the
+// `using` dispose. The handler would then call Cancel() on a disposed token
+// source and throw ObjectDisposedException as an unhandled exception. We instead
+// manually dispose in the finally block AFTER unsubscribing the handlers, and
+// wrap the in-handler Cancel() calls in a defensive try/catch so that even a
+// late-arriving ProcessExit (e.g. forced by Environment.Exit before finally
+// runs) cannot crash the process on its way out.
+var cts = new CancellationTokenSource();
+
+void SafeCancel()
+{
+    try { cts.Cancel(); }
+    catch (ObjectDisposedException) { /* shutdown is already in progress */ }
+}
+
+ConsoleCancelEventHandler cancelKeyHandler = (_, e) =>
 {
     e.Cancel = true;
-    cts.Cancel();
+    SafeCancel();
 };
-AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
+EventHandler processExitHandler = (_, _) => SafeCancel();
+
+Console.CancelKeyPress         += cancelKeyHandler;
+AppDomain.CurrentDomain.ProcessExit += processExitHandler;
 
 ServiceProvider? serviceProvider = null;
 ILogger? logger = null;
@@ -67,6 +85,13 @@ finally
         logger?.LogInformation("Disposing services.");
         await serviceProvider.DisposeAsync();
     }
+
+    // Unsubscribe before disposing the CancellationTokenSource so a late
+    // ProcessExit firing on AppDomain unload doesn't reach a disposed instance.
+    // SafeCancel's try/catch is the second line of defence; this is the first.
+    Console.CancelKeyPress         -= cancelKeyHandler;
+    AppDomain.CurrentDomain.ProcessExit -= processExitHandler;
+    cts.Dispose();
 }
 
 return;
