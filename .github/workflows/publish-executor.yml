@@ -10,6 +10,7 @@ env:
   IMAGE_NAME: xianix-executor
   DOCKERHUB_USERNAME: hasithy99x
   DOCKERHUB_ORG: 99xio
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-push:
@@ -17,7 +18,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -45,7 +46,7 @@ jobs:
           org.opencontainers.image.vendor=${{ env.DOCKERHUB_ORG }}
 
     - name: Build and push Docker image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: ./Executor
         file: ./Executor/Dockerfile
