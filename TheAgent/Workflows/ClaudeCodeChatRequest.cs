@@ -63,4 +63,26 @@ public sealed record ClaudeCodeChatRequest
     /// </summary>
     public IReadOnlyDictionary<string, string> Inputs { get; init; } =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Optional Claude model for this chat-driven run (e.g. <c>claude-haiku-4-5</c>). Empty
+    /// means "use the executor's configured default". Mirrors the webhook path's per-execution
+    /// model so chat runs can tier cost too.
+    /// </summary>
+    public string Model { get; init; } = string.Empty;
+
+    /// <summary>Optional hard cap on agent turns; null means no cap.</summary>
+    public int? MaxTurns { get; init; }
+
+    /// <summary>Optional tool allow-list; empty means no restriction.</summary>
+    public IReadOnlyList<string> AllowedTools { get; init; } = [];
+
+    /// <summary>Optional tool deny-list; empty means no restriction.</summary>
+    public IReadOnlyList<string> DisallowedTools { get; init; } = [];
+
+    /// <summary>Optional hard spend cap (USD) for this chat-driven run; null means no cap.</summary>
+    public double? MaxBudgetUsd { get; init; }
+
+    /// <summary>When true, resume the prior session for this conversation (best-effort). Defaults to false.</summary>
+    public bool ResumeSessions { get; init; }
 }

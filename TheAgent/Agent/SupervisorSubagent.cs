@@ -5,6 +5,7 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xianix;
+using Xianix.Workflows;
 using Xians.Lib.Agents.Core;
 using Xians.Lib.Agents.Messaging;
 
@@ -211,6 +212,10 @@ public sealed class SupervisorSubagent
 
         AgentResponse? lastResponse = null;
 
+        // Token usage is summed across attempts: each attempt is a billed Claude call, so an
+        // empty-response retry that eventually succeeds still consumed tokens on every try.
+        long? inputTokens = null, outputTokens = null, cacheReadTokens = null, cacheCreationTokens = null;
+
         for (var i = 0; i < attempts.Length; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -239,6 +244,12 @@ public sealed class SupervisorSubagent
                 .RunAsync(context.Message.Text, session, runOptions, cancellationToken)
                 .ConfigureAwait(false);
 
+            var (attemptIn, attemptOut, attemptCacheRead, attemptCacheCreate) = ExtractUsage(lastResponse.Usage);
+            if (attemptIn.HasValue)          inputTokens         = (inputTokens         ?? 0) + attemptIn.Value;
+            if (attemptOut.HasValue)         outputTokens        = (outputTokens        ?? 0) + attemptOut.Value;
+            if (attemptCacheRead.HasValue)   cacheReadTokens     = (cacheReadTokens     ?? 0) + attemptCacheRead.Value;
+            if (attemptCacheCreate.HasValue) cacheCreationTokens = (cacheCreationTokens ?? 0) + attemptCacheCreate.Value;
+
             var text = lastResponse.Text;
             if (!string.IsNullOrWhiteSpace(text))
             {
@@ -251,6 +262,7 @@ public sealed class SupervisorSubagent
                         context.Message.TenantId, context.Message.ParticipantId,
                         lastResponse.ResponseId);
                 }
+                await ReportTurnAsync(succeeded: true, attemptsMade: i + 1).ConfigureAwait(false);
                 return text;
             }
 
@@ -282,7 +294,71 @@ public sealed class SupervisorSubagent
             lastResponse?.ResponseId,
             Truncate(context.Message.Text, 200));
 
+        await ReportTurnAsync(succeeded: false, attemptsMade: attempts.Length).ConfigureAwait(false);
         return EmptyResponseFallback;
+
+        // Reports the turn's aggregate Claude usage to Xians. Local function so it closes over
+        // the accumulated token sums and the final response metadata. Never throws: metrics
+        // are non-critical and must not break the user's reply.
+        async Task ReportTurnAsync(bool succeeded, int attemptsMade)
+        {
+            try
+            {
+                await ExecutionMetrics.ReportConversationAsync(new ConversationMetricsContext
+                {
+                    CustomIdentifier    = ExecutionMetrics.ChatSource,
+                    TenantId            = context.Message.TenantId,
+                    ParticipantId       = context.Message.ParticipantId,
+                    Succeeded           = succeeded,
+                    Attempts            = attemptsMade,
+                    FinishReason        = lastResponse?.FinishReason?.ToString() ?? string.Empty,
+                    ResponseId          = lastResponse?.ResponseId ?? string.Empty,
+                    Model               = _modelName,
+                    InputTokens         = inputTokens,
+                    OutputTokens        = outputTokens,
+                    CacheReadTokens     = cacheReadTokens,
+                    CacheCreationTokens = cacheCreationTokens,
+                }).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed to report chat conversation metrics for tenant '{TenantId}', " +
+                    "participant '{ParticipantId}'. Metrics are non-critical.",
+                    context.Message.TenantId, context.Message.ParticipantId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pulls token counts out of an Anthropic response's <see cref="UsageDetails"/>. Input and
+    /// output come from the first-class properties; prompt-cache reads/writes live in
+    /// <see cref="UsageDetails.AdditionalCounts"/> under provider-specific keys, so they are
+    /// matched loosely (any "cache" key, split by read vs create/write) to stay robust to
+    /// minor naming differences across SDK versions.
+    /// </summary>
+    private static (long? Input, long? Output, long? CacheRead, long? CacheCreate) ExtractUsage(UsageDetails? usage)
+    {
+        if (usage is null)
+            return (null, null, null, null);
+
+        long? cacheRead = null, cacheCreate = null;
+        if (usage.AdditionalCounts is { } extra)
+        {
+            foreach (var (key, value) in extra)
+            {
+                if (key.IndexOf("cache", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                if (key.IndexOf("read", StringComparison.OrdinalIgnoreCase) >= 0)
+                    cacheRead = (cacheRead ?? 0) + value;
+                else if (key.IndexOf("creat", StringComparison.OrdinalIgnoreCase) >= 0
+                      || key.IndexOf("write", StringComparison.OrdinalIgnoreCase) >= 0)
+                    cacheCreate = (cacheCreate ?? 0) + value;
+            }
+        }
+
+        return (usage.InputTokenCount, usage.OutputTokenCount, cacheRead, cacheCreate);
     }
 
     private readonly record struct RunAttempt(string Instructions, bool IncludeHistory, string Label);

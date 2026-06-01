@@ -128,6 +128,12 @@ public class ProcessingWorkflow
             ClaudeCodePlugins = pluginsJson,
             WithEnvsJson      = envsJson,
             Prompt            = result.Execution.Prompt,
+            Model             = result.Execution.Model,
+            MaxTurns          = result.Execution.MaxTurns,
+            AllowedTools      = result.Execution.AllowedTools,
+            DisallowedTools   = result.Execution.DisallowedTools,
+            MaxBudgetUsd      = result.Execution.MaxBudgetUsd,
+            ResumeSessions    = result.Execution.ResumeSessions,
         };
     }
 
@@ -290,6 +296,7 @@ public class ProcessingWorkflow
                 Platform         = execution?.Platform       ?? string.Empty,
                 Prompt           = execution?.Prompt         ?? string.Empty,
                 BlockName        = orchestrationResult.ExecutionBlockName,
+                MaxBudgetUsd     = execution?.MaxBudgetUsd,
                 Plugins          = execution?.Plugins ?? (IReadOnlyList<PluginEntry>)[],
                 ExtraMetadata    = new Dictionary<string, string>
                 {

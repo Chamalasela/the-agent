@@ -356,6 +356,55 @@ public sealed class SupervisorSubagentTools(UserMessageContext context, ILogger<
         return $"{clonePrefix}Started Claude Code on `{repoName}`{pluginSuffix}. Output will be streamed in subsequent messages — do not repeat it back to the user.";
     }
 
+    [Description(
+        "Permanently remove a repository from this tenant's workspace. " +
+        "Use this when the user asks to delete, remove, or offboard a repository, " +
+        "or when a previous OnboardRepository call failed and the user wants to clean up " +
+        "the partially-cloned volume before trying again. " +
+        "This deletes the entire Docker volume that stores the bare clone, all cached " +
+        "context files, and all Claude Code session state for that repository — " +
+        "the data cannot be recovered. " +
+        "Always confirm with the user before calling this tool. " +
+        "Returns immediately with a success or error message; no follow-up workflow messages are sent.")]
+    public async Task<string> OffboardRepository(
+        [Description("The repository URL to remove. Must be exactly as shown in ListTenantRepositories.")] string repositoryUrl)
+    {
+        if (string.IsNullOrWhiteSpace(repositoryUrl))
+            return "ERROR: repositoryUrl is required. Call ListTenantRepositories to see which repositories are onboarded.";
+
+        var tenantId = context.Message.TenantId;
+
+        var existing = await TenantVolumeReader.ListAsync(tenantId);
+        if (!existing.Any(r => string.Equals(r.Url, repositoryUrl, StringComparison.Ordinal)))
+        {
+            return $"Repository `{repositoryUrl}` is not onboarded for this tenant — nothing to remove.";
+        }
+
+        var repoName = RepositoryNaming.DeriveName(repositoryUrl);
+
+        _logger.LogInformation(
+            "Offboarding repository: tenant={TenantId} repo={RepoName} url={RepositoryUrl}",
+            tenantId, repoName, repositoryUrl);
+
+        var result = await TenantVolumeReader.DeleteAsync(tenantId, repositoryUrl);
+
+        return result switch
+        {
+            DeleteVolumeResult.Deleted =>
+                $"Repository `{repoName}` has been removed from this tenant's workspace. " +
+                "The clone, cached context, and all session state for that repository have been deleted.",
+
+            DeleteVolumeResult.NotFound =>
+                $"Repository `{repoName}` was already absent — no volume to remove.",
+
+            DeleteVolumeResult.InUse =>
+                $"ERROR: Repository `{repoName}` is currently being used by a running execution and cannot be deleted right now. " +
+                "Wait for any active runs to finish and try again.",
+
+            _ => "ERROR: Unexpected result from volume deletion. Please try again.",
+        };
+    }
+
     /// <summary>
     /// Builds an actionable error string the model can use to ask the user for the missing
     /// inputs. Lists each plugin with its closest-matching usage example and the inputs that

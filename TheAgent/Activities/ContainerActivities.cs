@@ -304,6 +304,87 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Permanently deletes the Docker volume that holds the bare-cloned repository for the
+    /// given tenant+repo pair. The volume is identified by its <c>xianix.repository</c> label
+    /// rather than by rebuilding the hash-based name, so the operation is safe even if the
+    /// naming scheme ever changes.
+    ///
+    /// Safety: the volume's <c>xianix.tenant</c> label is verified to match
+    /// <paramref name="tenantId"/> before removal — a tenant can only delete their own volumes.
+    ///
+    /// If the volume is currently mounted by a running container the Docker daemon will refuse
+    /// the removal; a clear <see cref="ApplicationFailureException"/> is raised so Temporal can
+    /// surface it without retrying.
+    ///
+    /// Returns <c>true</c> when the volume was found and deleted, <c>false</c> when no matching
+    /// volume exists (idempotent — treat as success for offboarding flows).
+    /// </summary>
+    [Activity]
+    public async Task<bool> DeleteWorkspaceVolumeAsync(string tenantId, string repositoryUrl)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(repositoryUrl);
+
+        var logger = ActivityExecutionContext.Current.Logger;
+        logger.LogInformation(
+            "Attempting to delete workspace volume for tenant={TenantId} repo={RepositoryUrl}.",
+            tenantId, repositoryUrl);
+
+        var volumes = await _docker.Volumes.ListAsync();
+        var target = (volumes.Volumes ?? Enumerable.Empty<VolumeResponse>())
+            .FirstOrDefault(v =>
+                v.Labels != null
+                && v.Labels.TryGetValue("xianix.tenant", out var t)     && t == tenantId
+                && v.Labels.TryGetValue("xianix.repository", out var r) && r == repositoryUrl
+                && v.Labels.TryGetValue("xianix.managed", out var m)    && m == "true");
+
+        if (target is null)
+        {
+            logger.LogWarning(
+                "No managed volume found for tenant={TenantId} repo={RepositoryUrl} — treating as already removed.",
+                tenantId, repositoryUrl);
+            return false;
+        }
+
+        logger.LogInformation(
+            "Deleting volume '{VolumeName}' for tenant={TenantId} repo={RepositoryUrl}.",
+            target.Name, tenantId, repositoryUrl);
+
+        try
+        {
+            await _docker.Volumes.RemoveAsync(target.Name, force: false);
+            logger.LogInformation(
+                "Deleted volume '{VolumeName}' for tenant={TenantId}.", target.Name, tenantId);
+            return true;
+        }
+        catch (DockerApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            // Volume is in use by a running container.
+            logger.LogError(ex,
+                "Volume '{VolumeName}' is currently in use and cannot be deleted.", target.Name);
+            throw new ApplicationFailureException(
+                $"The repository volume is currently in use by a running container and cannot be deleted right now. " +
+                $"Wait for any active executions to finish and try again.",
+                nonRetryable: true);
+        }
+        catch (DockerApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            // Removed between our list and the delete call — treat as success.
+            logger.LogWarning(
+                "Volume '{VolumeName}' vanished between list and delete — treating as already removed.",
+                target.Name);
+            return false;
+        }
+        catch (DockerApiException ex)
+        {
+            logger.LogError(ex,
+                "Docker API error while deleting volume '{VolumeName}' for tenant={TenantId}.",
+                target.Name, tenantId);
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Removes the container. The workspace volume is intentionally kept for reuse.
     /// </summary>
     [Activity]
@@ -398,6 +479,43 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
         SetRuntime(env, prov, "XIANIX-INPUTS",        input.InputsJson);
         SetRuntime(env, prov, "CLAUDE-CODE-PLUGINS",  input.ClaudeCodePlugins);
         SetRuntime(env, prov, "PROMPT",               input.Prompt);
+
+        // Cost-control levers — only seeded when the rule (or chat caller) actually set them,
+        // so the executor falls back to its own defaults otherwise and the env summary stays
+        // uncluttered for the common "no override" case.
+        if (!string.IsNullOrWhiteSpace(input.Model))
+            SetRuntime(env, prov, "XIANIX-MODEL", input.Model);
+
+        if (input.MaxTurns is { } maxTurns && maxTurns > 0)
+            SetRuntime(env, prov, "XIANIX-MAX-TURNS", maxTurns.ToString());
+
+        // Host-wide opt-in backstop the executor uses only when the rule didn't set its own
+        // max-turns. Off (0) by default so behaviour is unchanged unless an operator enables it.
+        var defaultMaxTurns = EnvConfig.ExecutorDefaultMaxTurns;
+        if (defaultMaxTurns > 0)
+            SetRuntime(env, prov, "XIANIX-DEFAULT-MAX-TURNS", defaultMaxTurns.ToString());
+
+        if (input.AllowedTools is { Count: > 0 })
+            SetRuntime(env, prov, "XIANIX-ALLOWED-TOOLS", string.Join(",", input.AllowedTools));
+
+        if (input.DisallowedTools is { Count: > 0 })
+            SetRuntime(env, prov, "XIANIX-DISALLOWED-TOOLS", string.Join(",", input.DisallowedTools));
+
+        if (input.MaxBudgetUsd is { } budget && budget > 0)
+            SetRuntime(env, prov, "XIANIX-MAX-BUDGET-USD",
+                budget.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+        if (input.ResumeSessions)
+            SetRuntime(env, prov, "XIANIX-RESUME-SESSIONS", "1");
+
+        // Host-wide opt-in for the hybrid LLM context narrative. Seeded only when enabled so the
+        // env summary stays clean by default; a tenant can still flip it per rule-set via
+        // with-envs (which is injected afterwards and overrides this runtime seed).
+        if (EnvConfig.ExecutorContextLlm)
+        {
+            SetRuntime(env, prov, "XIANIX-CONTEXT-LLM", "1");
+            SetRuntime(env, prov, "XIANIX-CONTEXT-LLM-MODEL", EnvConfig.ExecutorContextLlmModel);
+        }
 
         if (!string.IsNullOrEmpty(anthropic))
         {
@@ -622,6 +740,9 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
         {
             "TENANT-ID", "EXECUTION-ID", "XIANIX-INPUTS",
             "CLAUDE-CODE-PLUGINS", "PROMPT", "ANTHROPIC-API-KEY",
+            "XIANIX-MODEL", "XIANIX-MAX-TURNS", "XIANIX-DEFAULT-MAX-TURNS",
+            "XIANIX-ALLOWED-TOOLS", "XIANIX-DISALLOWED-TOOLS", "XIANIX-MAX-BUDGET-USD",
+            "XIANIX-RESUME-SESSIONS", "XIANIX-CONTEXT-LLM", "XIANIX-CONTEXT-LLM-MODEL",
         };
         var ordered = prov
             .OrderBy(kv => Array.IndexOf(runtimeOrder, kv.Key) is var idx && idx >= 0 ? idx : int.MaxValue)

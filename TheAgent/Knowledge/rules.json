@@ -111,6 +111,7 @@
                         "marketplace": "xianix-team/plugins-official"
                     }
                 ],
+                "model": "claude-haiku-4-5",
                 "execute-prompt": "Issue #{{issue-number}} in the repository {{repository-name}} has been assigned to xianix-agent for requirement analysis.\n\nRun /requirement-analysis {{issue-number}} to perform the automated requirement analysis and elaboration."
             },
             {
@@ -139,6 +140,11 @@
                         "name": "AZURE-DEVOPS-TOKEN",
                         "value": "secrets.AZURE-DEVOPS-TOKEN",
                         "mandatory": true
+                    },
+                    {
+                        "name": "ANTHROPIC-MODEL",
+                        "value": "claude-haiku-4-5",
+                        "constant": true
                     }
                 ],
                 "execute-prompt": "Work item #{{workitem-id}} has been assigned to xianix-agent for requirement analysis.\n\nRun /requirement-analysis {{workitem-id}} to perform the automated requirement analysis and elaboration."

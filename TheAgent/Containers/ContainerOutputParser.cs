@@ -34,6 +34,7 @@ public static class ContainerOutputParser
             result.CacheCreationTokens = GetLong(root, "cache_creation_tokens");
             result.SessionId           = GetString(root, "session_id");
             result.DurationSeconds     = GetDouble(root, "duration_seconds");
+            result.Models              = GetStringArray(root, "models");
         }
         catch (JsonException ex)
         {
@@ -73,4 +74,18 @@ public static class ContainerOutputParser
     private static string? GetString(JsonElement root, string prop)
         => root.TryGetProperty(prop, out var el) && el.ValueKind == JsonValueKind.String
             ? el.GetString() : null;
+
+    private static IReadOnlyList<string>? GetStringArray(JsonElement root, string prop)
+    {
+        if (!root.TryGetProperty(prop, out var el) || el.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var values = el.EnumerateArray()
+            .Where(e => e.ValueKind == JsonValueKind.String)
+            .Select(e => e.GetString()!)
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .ToList();
+
+        return values.Count == 0 ? null : values;
+    }
 }

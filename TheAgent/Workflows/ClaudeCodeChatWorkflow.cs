@@ -66,6 +66,12 @@ public class ClaudeCodeChatWorkflow
             ClaudeCodePlugins = ContainerPluginSerialization.Serialize(req.Plugins),
             WithEnvsJson      = ContainerEnvSerialization.Serialize(req.WithEnvs),
             Prompt            = req.Prompt,
+            Model             = req.Model,
+            MaxTurns          = req.MaxTurns,
+            AllowedTools      = req.AllowedTools,
+            DisallowedTools   = req.DisallowedTools,
+            MaxBudgetUsd      = req.MaxBudgetUsd,
+            ResumeSessions    = req.ResumeSessions,
             VolumeName        = volumeName,
         };
 
@@ -152,6 +158,7 @@ public class ClaudeCodeChatWorkflow
                 GitRef           = InputOrEmpty(req.Inputs, "git-ref"),
                 Platform         = InputOrEmpty(req.Inputs, "platform"),
                 Prompt           = req.Prompt,
+                MaxBudgetUsd     = req.MaxBudgetUsd,
                 Plugins          = req.Plugins,
                 ExtraMetadata    = new Dictionary<string, string>
                 {

@@ -38,6 +38,44 @@ public sealed record ContainerExecutionInput
     /// </summary>
     public required string Prompt { get; init; }
 
+    /// <summary>
+    /// Optional Claude model for this run (e.g. <c>claude-haiku-4-5</c>). Seeded as the
+    /// <c>XIANIX-MODEL</c> env var and passed by the executor to the Claude Code SDK as the
+    /// primary model. Empty means "use the executor's configured default" — the cost lever
+    /// for model tiering.
+    /// </summary>
+    public string Model { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Optional hard cap on agent turns. Seeded as <c>XIANIX-MAX-TURNS</c>; null means no cap
+    /// (only the container wall-clock timeout applies). A token backstop against runaway loops.
+    /// </summary>
+    public int? MaxTurns { get; init; }
+
+    /// <summary>
+    /// Optional tool allow-list. Seeded as comma-separated <c>XIANIX-ALLOWED-TOOLS</c>; empty
+    /// means no restriction.
+    /// </summary>
+    public IReadOnlyList<string> AllowedTools { get; init; } = [];
+
+    /// <summary>
+    /// Optional tool deny-list. Seeded as comma-separated <c>XIANIX-DISALLOWED-TOOLS</c>; empty
+    /// means no restriction.
+    /// </summary>
+    public IReadOnlyList<string> DisallowedTools { get; init; } = [];
+
+    /// <summary>
+    /// Optional hard spend cap (USD). Seeded as <c>XIANIX-MAX-BUDGET-USD</c> and passed to the
+    /// Claude Code SDK as <c>max_budget_usd</c> to abort the run once exceeded. Null means no cap.
+    /// </summary>
+    public double? MaxBudgetUsd { get; init; }
+
+    /// <summary>
+    /// When true, the executor resumes the prior session for this conversation (best-effort).
+    /// Seeded as <c>XIANIX-RESUME-SESSIONS</c>. Defaults to <c>false</c>.
+    /// </summary>
+    public bool ResumeSessions { get; init; }
+
     public string VolumeName { get; init; } = string.Empty;
 
     /// <summary>

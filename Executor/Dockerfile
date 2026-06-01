@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     jq \
+    universal-ctags \
     ca-certificates \
     gnupg \
     && mkdir -p /etc/apt/keyrings \
@@ -70,8 +71,9 @@ COPY execute_plugin.py /workspace/execute_plugin.py
 COPY _common.sh /workspace/_common.sh
 COPY prepare_repo.sh /workspace/prepare_repo.sh
 COPY run_prompt.sh /workspace/run_prompt.sh
+COPY generate_context.sh /workspace/generate_context.sh
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /workspace/prepare_repo.sh /workspace/run_prompt.sh
+RUN chmod +x /entrypoint.sh /workspace/prepare_repo.sh /workspace/run_prompt.sh /workspace/generate_context.sh
 
 RUN groupadd -r xianix && useradd -r -g xianix -d /workspace xianix \
     && mkdir -p /workspace/repo \

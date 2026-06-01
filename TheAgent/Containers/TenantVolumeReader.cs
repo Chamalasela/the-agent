@@ -5,9 +5,9 @@ using Xianix.Activities;
 namespace Xianix.Containers;
 
 /// <summary>
-/// Direct (non-Temporal) read-only helper for enumerating repositories belonging to a tenant.
-/// Used by the SupervisorSubagent chat tool, where listing volumes is a single sub-second
-/// Docker call with no orchestration value to wrapping in a workflow.
+/// Direct (non-Temporal) helper for reading and deleting tenant repository volumes.
+/// Used by the SupervisorSubagent chat tools, where each operation is a sub-second
+/// Docker API call with no orchestration value to wrapping in a Temporal workflow.
 ///
 /// The authoritative tenant→repo mapping lives in Docker volume labels; see
 /// <see cref="ContainerActivities.EnsureWorkspaceVolumeAsync"/> for label population and
@@ -43,4 +43,66 @@ public static class TenantVolumeReader
             .OrderByDescending(r => r.CreatedAt)
             .ToList();
     }
+
+    /// <summary>
+    /// Permanently deletes the Docker volume that holds the bare-cloned repository for the
+    /// given tenant+repo pair.
+    ///
+    /// The volume is located by its <c>xianix.repository</c> label — not by recomputing the
+    /// hash-based name — so the operation is safe even if the naming scheme ever changes.
+    /// The <c>xianix.tenant</c> and <c>xianix.managed</c> labels are verified before removal
+    /// so a tenant can only delete their own managed volumes.
+    ///
+    /// Returns <see cref="DeleteVolumeResult.Deleted"/> when the volume was found and removed,
+    /// <see cref="DeleteVolumeResult.NotFound"/> when no matching volume exists (idempotent),
+    /// or <see cref="DeleteVolumeResult.InUse"/> when a running container is currently
+    /// mounting the volume (the caller should surface this as a retryable user error).
+    /// </summary>
+    public static async Task<DeleteVolumeResult> DeleteAsync(
+        string tenantId, string repositoryUrl, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(repositoryUrl);
+
+        using var docker = new DockerClientConfiguration().CreateClient();
+        var volumes = await docker.Volumes.ListAsync(cancellationToken);
+
+        var target = (volumes.Volumes ?? Enumerable.Empty<VolumeResponse>())
+            .FirstOrDefault(v =>
+                v.Labels != null
+                && v.Labels.TryGetValue("xianix.tenant",     out var t) && t == tenantId
+                && v.Labels.TryGetValue("xianix.repository", out var r) && r == repositoryUrl
+                && v.Labels.TryGetValue("xianix.managed",    out var m) && m == "true");
+
+        if (target is null)
+            return DeleteVolumeResult.NotFound;
+
+        try
+        {
+            await docker.Volumes.RemoveAsync(target.Name, force: false, cancellationToken);
+            return DeleteVolumeResult.Deleted;
+        }
+        catch (DockerApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            return DeleteVolumeResult.InUse;
+        }
+        catch (DockerApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            // Removed between our list and the delete call — treat as success.
+            return DeleteVolumeResult.Deleted;
+        }
+    }
+}
+
+/// <summary>Outcome of a <see cref="TenantVolumeReader.DeleteAsync"/> call.</summary>
+public enum DeleteVolumeResult
+{
+    /// <summary>The volume was found and successfully deleted.</summary>
+    Deleted,
+
+    /// <summary>No managed volume matched the tenant+repo pair — already absent.</summary>
+    NotFound,
+
+    /// <summary>A running container is currently mounting the volume; deletion was refused.</summary>
+    InUse,
 }

@@ -231,7 +231,13 @@ public sealed class WebhookRulesEvaluator : IWebhookRulesEvaluator
                 Platform:             platform,
                 RepositoryUrl:        repoUrl,
                 RepositoryName:       repoName,
-                GitRef:               gitRef));
+                GitRef:               gitRef,
+                Model:                execution.Model,
+                MaxTurns:             execution.MaxTurns,
+                AllowedTools:         execution.AllowedTools,
+                DisallowedTools:      execution.DisallowedTools,
+                MaxBudgetUsd:         execution.MaxBudgetUsd,
+                ResumeSessions:       execution.ResumeSessions));
         }
 
         if (matches.Count > 0)
