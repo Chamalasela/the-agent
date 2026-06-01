@@ -74,12 +74,22 @@ configure_credentials() {
 
     case "${PLATFORM}" in
         github)
-            if [ -n "${GITHUB_TOKEN:-}" ]; then
-                local gh_token
-                gh_token=$(_trim_token "${GITHUB_TOKEN}")
-                printf 'https://x-access-token:%s@github.com\n' "${gh_token}" >> "${GIT_CRED_FILE}"
-                export GH_TOKEN="${gh_token}"
+            if [ -z "${GITHUB_TOKEN:-}" ]; then
+                # Fail loudly instead of cloning anonymously. An anonymous clone of a
+                # private repo makes GitHub answer "Repository not found" (it masks 403
+                # as 404), which is indistinguishable from a genuinely wrong URL. Mirror
+                # the azuredevops fail-fast below so the user gets an actionable error.
+                log "FATAL: GITHUB-TOKEN is required when platform=github."
+                exit 1
             fi
+            local gh_token
+            gh_token=$(_trim_token "${GITHUB_TOKEN}")
+            if [ -z "${gh_token}" ]; then
+                log "FATAL: GITHUB-TOKEN is empty after trimming whitespace."
+                exit 1
+            fi
+            printf 'https://x-access-token:%s@github.com\n' "${gh_token}" >> "${GIT_CRED_FILE}"
+            export GH_TOKEN="${gh_token}"
             ;;
         azuredevops)
             if [ -z "${AZURE_DEVOPS_TOKEN:-}" ]; then
