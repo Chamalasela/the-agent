@@ -272,71 +272,32 @@ public class ProcessingWorkflow
     {
         try
         {
-            var succeeded = executionResult.Succeeded ? 1 : 0;
-            var failed    = executionResult.Succeeded ? 0 : 1;
-            var blockName = orchestrationResult.ExecutionBlockName;
+            var execution = orchestrationResult.Execution;
 
-            var builder = XiansContext.Metrics
-                .ForModel("claude")
-                .WithCustomIdentifier(orchestrationResult.WebhookName)
-                .WithMetadata(new Dictionary<string, string> {
-                    { "repository_url", orchestrationResult.Execution?.RepositoryUrl ?? string.Empty },
-                    { "git_ref", orchestrationResult.Execution?.GitRef ?? string.Empty },
-                    { "prompt", orchestrationResult.Execution?.Prompt ?? string.Empty },
-                    { "execution_block_name", orchestrationResult.ExecutionBlockName ?? string.Empty } });
-
-            // Named webhook-driven runs: track totals and per-block breakdown so a
-            // dashboard can chart overall throughput or drill into individual execution
-            // blocks (e.g. "azuredevops-pull-request-review" vs "github-pr-review").
-            if (!string.IsNullOrWhiteSpace(blockName))
+            // All runs reaching this workflow are webhook-driven (ProcessingWorkflow is only
+            // started by the webhook handler), so they always land in webhook-executions.
+            // Named runs additionally get a per-block breakdown via BlockName. Chat-initiated
+            // runs report their own chat-executions metrics from ClaudeCodeChatWorkflow.
+            var ctx = new ExecutionMetricsContext
             {
-                builder = builder
-                    .WithMetric("webhook-executions", "called",                 1,         "count")
-                    .WithMetric("webhook-executions", "succeeded",              succeeded, "count")
-                    .WithMetric("webhook-executions", "failed",                 failed,    "count")
-                    .WithMetric("webhook-executions", blockName,                1,         "count")
-                    .WithMetric("webhook-executions", $"{blockName}.succeeded", succeeded, "count")
-                    .WithMetric("webhook-executions", $"{blockName}.failed",    failed,    "count");
+                Category         = ExecutionMetrics.WebhookCategory,
+                Source           = ExecutionMetrics.WebhookSource,
+                CustomIdentifier = orchestrationResult.WebhookName,
+                TenantId         = orchestrationResult.TenantId,
+                RepositoryUrl    = execution?.RepositoryUrl  ?? string.Empty,
+                RepositoryName   = execution?.RepositoryName ?? string.Empty,
+                GitRef           = execution?.GitRef         ?? string.Empty,
+                Platform         = execution?.Platform       ?? string.Empty,
+                Prompt           = execution?.Prompt         ?? string.Empty,
+                BlockName        = orchestrationResult.ExecutionBlockName,
+                Plugins          = execution?.Plugins ?? (IReadOnlyList<PluginEntry>)[],
+                ExtraMetadata    = new Dictionary<string, string>
+                {
+                    ["webhook_name"] = orchestrationResult.WebhookName,
+                },
+            };
 
-                if (executionResult.CostUsd.HasValue)
-                    builder = builder.WithMetric(
-                        "webhook-executions", $"{blockName}.cost", executionResult.CostUsd.Value, "usd");
-
-                if (executionResult.DurationSeconds.HasValue)
-                    builder = builder.WithMetric(
-                        "webhook-executions", $"{blockName}.duration", executionResult.DurationSeconds.Value, "seconds");
-            }
-            // Unnamed/chat-driven runs: tracked separately so they don't pollute
-            // webhook-executions totals and can be monitored independently.
-            else
-            {
-                builder = builder
-                    .WithMetric("chat-executions", "called",                         1,         "count")
-                    .WithMetric("chat-executions", "succeeded",                      succeeded, "count")
-                    .WithMetric("chat-executions", "failed",                         failed,    "count")
-                    .WithMetric("chat-executions", orchestrationResult.WebhookName,  1,         "count");
-
-                if (executionResult.CostUsd.HasValue)
-                    builder = builder.WithMetric(
-                        "chat-executions", "cost", executionResult.CostUsd.Value, "usd");
-            }
-
-            if (executionResult.CostUsd.HasValue)
-                builder = builder.WithMetric("cost", "usd", executionResult.CostUsd.Value, "usd");
-
-            if (executionResult.InputTokens.HasValue)
-                builder = builder.WithMetric("tokens", "input", executionResult.InputTokens.Value, "tokens");
-
-            if (executionResult.OutputTokens.HasValue)
-                builder = builder.WithMetric("tokens", "output", executionResult.OutputTokens.Value, "tokens");
-
-            if (executionResult.CacheReadTokens.HasValue)
-                builder = builder.WithMetric("tokens", "cache_read", executionResult.CacheReadTokens.Value, "tokens");
-
-            if (executionResult.CacheCreationTokens.HasValue)
-                builder = builder.WithMetric("tokens", "cache_creation", executionResult.CacheCreationTokens.Value, "tokens");
-
-            await builder.ReportAsync();
+            await ExecutionMetrics.ReportAsync(ctx, executionResult);
         }
         catch (Exception ex)
         {

@@ -86,6 +86,7 @@ public class ClaudeCodeChatWorkflow
                 ContainerWorkflowOptions.Wait);
 
             ContainerOutputParser.Parse(result);
+            await ReportChatExecutionMetricsAsync(req, result);
 
             string summary;
             if (result.Succeeded)
@@ -121,4 +122,53 @@ public class ClaudeCodeChatWorkflow
 
     private static Task NotifyAsync(ClaudeCodeChatRequest req, string text) =>
         XiansContext.Messaging.SendChatAsSupervisorAsync(text, participantId: req.ParticipantId, scope: req.Scope);
+
+    // ── Metrics ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Reports chat-initiated execution metrics to Xians under the <c>chat-executions</c>
+    /// category via the shared <see cref="ExecutionMetrics"/> reporter, so chat and webhook
+    /// runs emit an identical schema and can be charted side by side. Tracked separately
+    /// from <c>webhook-executions</c> so the two paths don't pollute each other's totals.
+    /// Failures are swallowed: metrics are non-critical and must never fail a user-facing run.
+    /// </summary>
+    private static async Task ReportChatExecutionMetricsAsync(
+        ClaudeCodeChatRequest req,
+        ContainerExecutionResult result)
+    {
+        try
+        {
+            // Chat runs carry git-ref / platform inside the resolved inputs rather than on a
+            // dedicated field (see SupervisorSubagentTools.RunClaudeCodeOnRepository), so pull
+            // them from there to keep metadata symmetric with the webhook path.
+            var ctx = new ExecutionMetricsContext
+            {
+                Category         = ExecutionMetrics.ChatCategory,
+                Source           = ExecutionMetrics.ChatSource,
+                CustomIdentifier = ExecutionMetrics.ChatSource,
+                TenantId         = req.TenantId,
+                RepositoryUrl    = req.RepositoryUrl,
+                RepositoryName   = req.RepositoryName,
+                GitRef           = InputOrEmpty(req.Inputs, "git-ref"),
+                Platform         = InputOrEmpty(req.Inputs, "platform"),
+                Prompt           = req.Prompt,
+                Plugins          = req.Plugins,
+                ExtraMetadata    = new Dictionary<string, string>
+                {
+                    ["participant_id"] = req.ParticipantId,
+                },
+            };
+
+            await ExecutionMetrics.ReportAsync(ctx, result);
+        }
+        catch (Exception ex)
+        {
+            Workflow.Logger.LogWarning(ex,
+                "Failed to report chat execution metrics for tenant '{TenantId}', repo '{Repo}'. Metrics are non-critical.",
+                req.TenantId, req.RepositoryName);
+        }
+    }
+
+    private static string InputOrEmpty(IReadOnlyDictionary<string, string> inputs, string key) =>
+        inputs.TryGetValue(key, out var value) ? value : string.Empty;
 }
