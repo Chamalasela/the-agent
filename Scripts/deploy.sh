@@ -15,7 +15,7 @@ VM_NAME="${DEPLOY_VM_NAME:-xianix-agent-vm}"
 SUBSCRIPTION="${DEPLOY_SUBSCRIPTION:-}"          # leave empty to use the az default
 AGENT_IMAGE="99xio/xianix-agent:latest"
 EXECUTOR_IMAGE="99xio/xianix-executor:latest"
-REMOTE_START_SCRIPT="/opt/xianix/scripts/start-agent.sh"
+REMOTE_START_SCRIPT="/etc/xianix/start-agent.sh"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
