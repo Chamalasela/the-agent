@@ -42,6 +42,8 @@
                         "marketplace": "xianix-team/plugins-official"
                     }
                 ],
+                "model": "claude-sonnet-4-5",
+                "max-budget-usd": 3.0,
                 "execute-prompt": "You are reviewing pull request {{pr-link}}. Run /pr-review to perform the automated review."
             },
             {
@@ -84,6 +86,8 @@
                         "mandatory": true
                     }
                 ],
+                "model": "claude-sonnet-4-5",
+                "max-budget-usd": 5.0,
                 "execute-prompt": "You are reviewing pull request #{{pr-number}} in the repository {{repository-name}} (branch: {{git-ref}}).\n\nRun /pr-review to perform the automated review. "
             },
             {
