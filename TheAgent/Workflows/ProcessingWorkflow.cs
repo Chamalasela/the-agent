@@ -10,7 +10,6 @@ using Xians.Lib.Agents.Core;
 
 namespace Xianix.Workflows;
 
-//[Workflow(Constants.AgentName + ":Processing Workflow")]
 [Workflow]
 public class ProcessingWorkflow
 {

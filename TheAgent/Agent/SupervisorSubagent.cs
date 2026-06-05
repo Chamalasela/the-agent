@@ -189,7 +189,7 @@ public sealed class SupervisorSubagent
         // Resolve the agent (and its API key) lazily inside the workflow context so
         // the rules.json knowledge document and the tenant's Xians Secret Vault are
         // both reachable. The cache is keyed by tenant ID — see EnsureAgentForTenantAsync
-        // — so each tenant gets their own AIAgent built against their own credentials.
+        // — so each tenant gets their own AIAgent built against theirsaftly own credentials.
         var agent = await EnsureAgentForTenantAsync(
             context.Message.TenantId, cancellationToken).ConfigureAwait(false);
 
