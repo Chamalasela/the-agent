@@ -14,6 +14,7 @@ Writes a structured JSON envelope to stdout (see `build_output`).
 All progress/debug output goes to stderr so it does not pollute the result stream.
 """
 import os
+import re
 import sys
 import json
 import time
@@ -59,6 +60,124 @@ def parse_plugins(raw: str) -> list[dict]:
         return [p for p in plugins if isinstance(p, dict)]
     except json.JSONDecodeError:
         return []
+
+
+def parse_tool_list(raw: str | None) -> list[str]:
+    """Split a comma-separated XIANIX-*-TOOLS env into a clean tool-name list."""
+    if not raw:
+        return []
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def parse_int_env(name: str) -> int | None:
+    """Read a positive int env var; returns None when unset, empty, or non-positive/invalid."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        log(f"WARNING: {name}='{raw}' is not an integer — ignoring.")
+        return None
+    return value if value > 0 else None
+
+
+def parse_float_env(name: str) -> float | None:
+    """Read a positive float env var; returns None when unset, empty, or non-positive/invalid."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        log(f"WARNING: {name}='{raw}' is not a number — ignoring.")
+        return None
+    return value if value > 0 else None
+
+
+# ── Session reuse (opt-in) ─────────────────────────────────────────────────────
+# Back-to-back runs against the same conversation (e.g. PR re-reviews on `synchronize`)
+# can resume the prior Claude Code session instead of rebuilding context from scratch.
+# The session id is persisted on the tenant volume keyed by repo + PR/issue/work-item, and
+# Claude's session history is persisted via CLAUDE_CONFIG_DIR (set in run_prompt.sh). Off by
+# default (XIANIX_RESUME_SESSIONS) and always best-effort — a failed resume falls back to a
+# fresh run so re-reviews can never be broken by a stale/missing session.
+
+_SESSION_DIR = "/workspace/repo/xianix-sessions"
+
+
+def session_key(inputs_raw: str | None) -> str | None:
+    """Stable per-conversation key (repo + PR/issue/work-item) for session resume, or None."""
+    if not inputs_raw:
+        return None
+    try:
+        data = json.loads(inputs_raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    repo = data.get("repository-name") or data.get("repository-url") or ""
+    item = (data.get("pr-number") or data.get("issue-number")
+            or data.get("work-item-id") or data.get("workitem-id") or "")
+    if not repo or not item:
+        return None
+    return re.sub(r"[^A-Za-z0-9._-]", "_", f"{repo}#{item}")
+
+
+def read_prior_session(key: str) -> str | None:
+    try:
+        with open(os.path.join(_SESSION_DIR, key), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def persist_session(key: str, session_id: str | None) -> None:
+    if not session_id:
+        return
+    try:
+        os.makedirs(_SESSION_DIR, exist_ok=True)
+        with open(os.path.join(_SESSION_DIR, key), "w", encoding="utf-8") as fh:
+            fh.write(session_id)
+    except OSError as exc:
+        log(f"WARNING: could not persist session id for '{key}': {exc}")
+
+
+async def collect_messages(prompt: str, options: ClaudeAgentOptions) -> dict:
+    """Runs one query and collects the assistant output / tool uses / usage into a dict."""
+    text_blocks: list[str] = []
+    tool_uses: list[dict] = []
+    models_seen: set[str] = set()
+    result_message: ResultMessage | None = None
+    turn_count = 0
+
+    async for message in query(prompt=prompt, options=options):
+        if isinstance(message, AssistantMessage):
+            turn_count += 1
+            log(f"[turn {turn_count}] assistant")
+            process_assistant_message(message, text_blocks, tool_uses, models_seen)
+
+        elif isinstance(message, UserMessage):
+            log(f"[turn {turn_count}] tool_result")
+            process_user_message(message)
+
+        elif isinstance(message, SystemMessage):
+            log("[system]")
+            process_system_message(message)
+
+        elif isinstance(message, ResultMessage):
+            result_message = message
+            log_separator("Result")
+            process_result_message(message)
+
+    return {
+        "text_blocks": text_blocks,
+        "tool_uses": tool_uses,
+        "models_seen": models_seen,
+        "result_message": result_message,
+        "turn_count": turn_count,
+    }
 
 
 def plugin_names(plugins: list[dict]) -> list[str]:
@@ -270,11 +389,32 @@ async def main() -> None:
     work_dir     = os.environ.get("WORK_DIR", "/workspace")
     plugins      = parse_plugins(os.environ.get("CLAUDE_CODE_PLUGINS", "[]"))
 
+    # ── Cost-control levers (all optional; injected by the control plane) ─────
+    # Primary model: XIANIX_MODEL (first-class rules.json `model`) wins, then a raw
+    # ANTHROPIC_MODEL passthrough (the zero-code with-envs path), else the SDK default.
+    model            = os.environ.get("XIANIX_MODEL") or os.environ.get("ANTHROPIC_MODEL") or None
+    # Per-execution max-turns wins; otherwise fall back to the host-wide backstop (off unless set).
+    max_turns        = parse_int_env("XIANIX_MAX_TURNS") or parse_int_env("XIANIX_DEFAULT_MAX_TURNS")
+    allowed_tools    = parse_tool_list(os.environ.get("XIANIX_ALLOWED_TOOLS"))
+    disallowed_tools = parse_tool_list(os.environ.get("XIANIX_DISALLOWED_TOOLS"))
+    max_budget_usd   = parse_float_env("XIANIX_MAX_BUDGET_USD")
+
+    # Route Claude Code's background/side-query work (titles, summaries, etc.) to a cheap
+    # Haiku-class model unless the operator already pinned one. ANTHROPIC_DEFAULT_HAIKU_MODEL
+    # is the current control; ANTHROPIC_SMALL_FAST_MODEL is its deprecated alias, set too for
+    # older CLI builds. setdefault keeps any explicit override intact.
+    os.environ.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5")
+    os.environ.setdefault("ANTHROPIC_SMALL_FAST_MODEL", "claude-haiku-4-5")
+
     log_separator("Configuration")
     log(f"tenant={tenant_id} execution={execution_id}")
     log(f"work_dir={work_dir}")
     log(f"plugins={plugin_names(plugins)}")
     log(f"ANTHROPIC_API_KEY={'set' if os.environ.get('ANTHROPIC_API_KEY') else 'MISSING'}")
+    log(f"model={model or '(sdk default)'} max_turns={max_turns or '(none)'} "
+        f"allowed_tools={allowed_tools or '(all)'} disallowed_tools={disallowed_tools or '(none)'} "
+        f"max_budget_usd={max_budget_usd if max_budget_usd is not None else '(none)'}")
+    log(f"haiku_model={os.environ.get('ANTHROPIC_DEFAULT_HAIKU_MODEL')}")
 
     log_separator("Prompt")
     log(f"prompt_length={len(prompt)} chars, {len(prompt.splitlines())} lines")
@@ -284,37 +424,51 @@ async def main() -> None:
     print("└────────────────────────────────────────────────────────", file=sys.stderr)
     sys.stderr.flush()
 
-    text_blocks: list[str] = []
-    tool_uses: list[dict] = []
-    models_seen: set[str] = set()
-    result_message: ResultMessage | None = None
-    turn_count = 0
+    # Build options from only the levers that were actually set, so an unset lever falls back
+    # to the SDK's own default rather than forcing an empty/zero value onto it.
+    option_kwargs: dict = {
+        "cwd": work_dir,
+        "permission_mode": "bypassPermissions",
+    }
+    if model:
+        option_kwargs["model"] = model
+    if max_turns is not None:
+        option_kwargs["max_turns"] = max_turns
+    if allowed_tools:
+        option_kwargs["allowed_tools"] = allowed_tools
+    if disallowed_tools:
+        option_kwargs["disallowed_tools"] = disallowed_tools
+    if max_budget_usd is not None:
+        option_kwargs["max_budget_usd"] = max_budget_usd
 
-    options = ClaudeAgentOptions(
-        cwd=work_dir,
-        permission_mode="bypassPermissions",
-    )
+    # Opt-in session resume: only when explicitly enabled and a prior session exists for this
+    # conversation (repo + PR/issue). Best-effort — a resume failure retries a fresh run.
+    resume_enabled = os.environ.get("XIANIX_RESUME_SESSIONS", "").strip().lower() in ("1", "true", "yes")
+    skey = session_key(os.environ.get("XIANIX_INPUTS")) if resume_enabled else None
+    prior_sid = read_prior_session(skey) if skey else None
+    log(f"session_resume={'on' if resume_enabled else 'off'} key={skey or '(none)'} "
+        f"prior_session={prior_sid or '(none)'}")
 
     log_separator("Execution")
 
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            turn_count += 1
-            log(f"[turn {turn_count}] assistant")
-            process_assistant_message(message, text_blocks, tool_uses, models_seen)
+    if prior_sid:
+        try:
+            log(f"Resuming session {prior_sid}.")
+            collected = await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs, resume=prior_sid))
+        except Exception as exc:  # noqa: BLE001 — resume must never harden into a hard failure
+            log(f"WARNING: session resume failed ({type(exc).__name__}: {exc}) — retrying fresh.")
+            collected = await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs))
+    else:
+        collected = await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs))
 
-        elif isinstance(message, UserMessage):
-            log(f"[turn {turn_count}] tool_result")
-            process_user_message(message)
+    text_blocks    = collected["text_blocks"]
+    tool_uses      = collected["tool_uses"]
+    models_seen    = collected["models_seen"]
+    result_message = collected["result_message"]
+    turn_count     = collected["turn_count"]
 
-        elif isinstance(message, SystemMessage):
-            log("[system]")
-            process_system_message(message)
-
-        elif isinstance(message, ResultMessage):
-            result_message = message
-            log_separator("Result")
-            process_result_message(message)
+    if skey:
+        persist_session(skey, getattr(result_message, "session_id", None))
 
     duration = time.monotonic() - _start_time
     usage = extract_usage(result_message)

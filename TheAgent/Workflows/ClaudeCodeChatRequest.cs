@@ -37,10 +37,20 @@ public sealed record ClaudeCodeChatRequest
     public IReadOnlyList<PluginEntry> Plugins { get; init; } = [];
 
     /// <summary>
-    /// Execution-level <c>with-envs</c> to inject into the executor container. Aggregated by
-    /// the chat tool from every <see cref="WebhookExecution"/> that references the chosen
-    /// plugins (deduplicated by env name). Defaults to no envs — chat runs with no plugins
-    /// don't need any extra credentials beyond the agent-managed runtime variables.
+    /// <c>with-envs</c> entries to inject into the executor container. The chat tool
+    /// builds this rule-wide via <see cref="RulesEnvCatalog.LoadEnvsForPlatformAsync"/>,
+    /// not per-plugin: a chat dispatch has no matched <see cref="WebhookExecution"/>, so
+    /// the catalog returns the union of
+    /// <list type="bullet">
+    ///   <item><description>every <see cref="WebhookRuleSet.WithEnvs"/> entry — the
+    ///     rule-set-wide common envs that apply to every execution in that rule set
+    ///     (e.g. a <c>GITHUB-TOKEN</c> declared once at the top of the rule set), and</description></item>
+    ///   <item><description>every <see cref="WebhookExecution.WithEnvs"/> entry whose
+    ///     execution matches the requested platform (or is platform-agnostic).</description></item>
+    /// </list>
+    /// Deduplicated by env name (first wins) so a rule-set common and a duplicate
+    /// execution-level entry collapse to one. Defaults to no envs — used as the wire
+    /// format only; the chat tool always populates it.
     /// </summary>
     public IReadOnlyList<EnvEntry> WithEnvs { get; init; } = [];
 
@@ -53,4 +63,26 @@ public sealed record ClaudeCodeChatRequest
     /// </summary>
     public IReadOnlyDictionary<string, string> Inputs { get; init; } =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Optional Claude model for this chat-driven run (e.g. <c>claude-haiku-4-5</c>). Empty
+    /// means "use the executor's configured default". Mirrors the webhook path's per-execution
+    /// model so chat runs can tier cost too.
+    /// </summary>
+    public string Model { get; init; } = string.Empty;
+
+    /// <summary>Optional hard cap on agent turns; null means no cap.</summary>
+    public int? MaxTurns { get; init; }
+
+    /// <summary>Optional tool allow-list; empty means no restriction.</summary>
+    public IReadOnlyList<string> AllowedTools { get; init; } = [];
+
+    /// <summary>Optional tool deny-list; empty means no restriction.</summary>
+    public IReadOnlyList<string> DisallowedTools { get; init; } = [];
+
+    /// <summary>Optional hard spend cap (USD) for this chat-driven run; null means no cap.</summary>
+    public double? MaxBudgetUsd { get; init; }
+
+    /// <summary>When true, resume the prior session for this conversation (best-effort). Defaults to false.</summary>
+    public bool ResumeSessions { get; init; }
 }

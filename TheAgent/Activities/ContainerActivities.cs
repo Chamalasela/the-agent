@@ -266,7 +266,14 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
             logger.LogInformation("Container '{ContainerId}' exited with code {ExitCode}.", shortId, exitCode);
 
             if (!string.IsNullOrWhiteSpace(stderr))
-                logger.LogDebug("Container stderr:\n{Stderr}", stderr);
+            {
+                if (exitCode != 0)
+                    logger.LogError(
+                        "## Container Log\n**Container:** `{ContainerId}` · **Exit:** {ExitCode}\n\n```\n{Stderr}\n```",
+                        shortId, exitCode, stderr);
+                else
+                    logger.LogInformation("Container '{ContainerId}' stderr:\n{Stderr}", shortId, stderr);
+            }
 
             if (exitCode != 0 && !string.IsNullOrWhiteSpace(stdout))
                 logger.LogError("Container '{ContainerId}' stdout on failure:\n{Stdout}", shortId, stdout);
@@ -293,6 +300,87 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
                 StdOut         = string.Empty,
                 StdErr         = $"Container timed out after {timeoutSeconds} seconds.",
             };
+        }
+    }
+
+    /// <summary>
+    /// Permanently deletes the Docker volume that holds the bare-cloned repository for the
+    /// given tenant+repo pair. The volume is identified by its <c>xianix.repository</c> label
+    /// rather than by rebuilding the hash-based name, so the operation is safe even if the
+    /// naming scheme ever changes.
+    ///
+    /// Safety: the volume's <c>xianix.tenant</c> label is verified to match
+    /// <paramref name="tenantId"/> before removal — a tenant can only delete their own volumes.
+    ///
+    /// If the volume is currently mounted by a running container the Docker daemon will refuse
+    /// the removal; a clear <see cref="ApplicationFailureException"/> is raised so Temporal can
+    /// surface it without retrying.
+    ///
+    /// Returns <c>true</c> when the volume was found and deleted, <c>false</c> when no matching
+    /// volume exists (idempotent — treat as success for offboarding flows).
+    /// </summary>
+    [Activity]
+    public async Task<bool> DeleteWorkspaceVolumeAsync(string tenantId, string repositoryUrl)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(repositoryUrl);
+
+        var logger = ActivityExecutionContext.Current.Logger;
+        logger.LogInformation(
+            "Attempting to delete workspace volume for tenant={TenantId} repo={RepositoryUrl}.",
+            tenantId, repositoryUrl);
+
+        var volumes = await _docker.Volumes.ListAsync();
+        var target = (volumes.Volumes ?? Enumerable.Empty<VolumeResponse>())
+            .FirstOrDefault(v =>
+                v.Labels != null
+                && v.Labels.TryGetValue("xianix.tenant", out var t)     && t == tenantId
+                && v.Labels.TryGetValue("xianix.repository", out var r) && r == repositoryUrl
+                && v.Labels.TryGetValue("xianix.managed", out var m)    && m == "true");
+
+        if (target is null)
+        {
+            logger.LogWarning(
+                "No managed volume found for tenant={TenantId} repo={RepositoryUrl} — treating as already removed.",
+                tenantId, repositoryUrl);
+            return false;
+        }
+
+        logger.LogInformation(
+            "Deleting volume '{VolumeName}' for tenant={TenantId} repo={RepositoryUrl}.",
+            target.Name, tenantId, repositoryUrl);
+
+        try
+        {
+            await _docker.Volumes.RemoveAsync(target.Name, force: false);
+            logger.LogInformation(
+                "Deleted volume '{VolumeName}' for tenant={TenantId}.", target.Name, tenantId);
+            return true;
+        }
+        catch (DockerApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            // Volume is in use by a running container.
+            logger.LogError(ex,
+                "Volume '{VolumeName}' is currently in use and cannot be deleted.", target.Name);
+            throw new ApplicationFailureException(
+                $"The repository volume is currently in use by a running container and cannot be deleted right now. " +
+                $"Wait for any active executions to finish and try again.",
+                nonRetryable: true);
+        }
+        catch (DockerApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            // Removed between our list and the delete call — treat as success.
+            logger.LogWarning(
+                "Volume '{VolumeName}' vanished between list and delete — treating as already removed.",
+                target.Name);
+            return false;
+        }
+        catch (DockerApiException ex)
+        {
+            logger.LogError(ex,
+                "Docker API error while deleting volume '{VolumeName}' for tenant={TenantId}.",
+                target.Name, tenantId);
+            throw;
         }
     }
 
@@ -369,11 +457,18 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
 
     private static async Task<List<string>> BuildEnvVarsAsync(ContainerExecutionInput input)
     {
-        // Only platform-agnostic runtime values + the agent-wide ANTHROPIC-API-KEY are seeded
-        // from the host. CM platform tokens (GITHUB-TOKEN, AZURE-DEVOPS-TOKEN, ...) are
-        // intentionally NOT injected here: tenants must supply their own via the Xians Secret
-        // Vault and reference them from rules.json as `secrets.<KEY>` so that no two tenants
+        // Only platform-agnostic runtime values + (optionally) the agent-wide
+        // ANTHROPIC-API-KEY are seeded from the host. CM platform tokens
+        // (GITHUB-TOKEN, AZURE-DEVOPS-TOKEN, ...) are intentionally NOT injected
+        // here: tenants must supply their own via the Xians Secret Vault and
+        // reference them from rules.json as `secrets.<KEY>` so that no two tenants
         // ever share the same platform credential.
+        //
+        // ANTHROPIC-API-KEY is now optional on the host (see EnvConfig.AnthropicApiKey).
+        // If it isn't set we skip the seed entirely; the rules.json `with-envs` merge
+        // below is then the sole source. InjectExecutionEnvVarsAsync still overrides
+        // any host-seeded value when a rules.json entry exists, preserving the
+        // long-standing "rules.json wins over host defaults" contract.
         var env       = new Dictionary<string, string>(StringComparer.Ordinal);
         var prov      = new Dictionary<string, EnvProvenance>(StringComparer.Ordinal);
         var anthropic = EnvConfig.AnthropicApiKey;
@@ -385,10 +480,50 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
         SetRuntime(env, prov, "CLAUDE-CODE-PLUGINS",  input.ClaudeCodePlugins);
         SetRuntime(env, prov, "PROMPT",               input.Prompt);
 
-        env["ANTHROPIC-API-KEY"]  = anthropic;
-        prov["ANTHROPIC-API-KEY"] = new EnvProvenance(
-            EnvSource.HostEnv, Detail: "ANTHROPIC-API-KEY", Resolved: !string.IsNullOrEmpty(anthropic),
-            Length: anthropic.Length, Mandatory: false, Override: false);
+        // Cost-control levers — only seeded when the rule (or chat caller) actually set them,
+        // so the executor falls back to its own defaults otherwise and the env summary stays
+        // uncluttered for the common "no override" case.
+        if (!string.IsNullOrWhiteSpace(input.Model))
+            SetRuntime(env, prov, "XIANIX-MODEL", input.Model);
+
+        if (input.MaxTurns is { } maxTurns && maxTurns > 0)
+            SetRuntime(env, prov, "XIANIX-MAX-TURNS", maxTurns.ToString());
+
+        // Host-wide opt-in backstop the executor uses only when the rule didn't set its own
+        // max-turns. Off (0) by default so behaviour is unchanged unless an operator enables it.
+        var defaultMaxTurns = EnvConfig.ExecutorDefaultMaxTurns;
+        if (defaultMaxTurns > 0)
+            SetRuntime(env, prov, "XIANIX-DEFAULT-MAX-TURNS", defaultMaxTurns.ToString());
+
+        if (input.AllowedTools is { Count: > 0 })
+            SetRuntime(env, prov, "XIANIX-ALLOWED-TOOLS", string.Join(",", input.AllowedTools));
+
+        if (input.DisallowedTools is { Count: > 0 })
+            SetRuntime(env, prov, "XIANIX-DISALLOWED-TOOLS", string.Join(",", input.DisallowedTools));
+
+        if (input.MaxBudgetUsd is { } budget && budget > 0)
+            SetRuntime(env, prov, "XIANIX-MAX-BUDGET-USD",
+                budget.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+        if (input.ResumeSessions)
+            SetRuntime(env, prov, "XIANIX-RESUME-SESSIONS", "1");
+
+        // Host-wide opt-in for the hybrid LLM context narrative. Seeded only when enabled so the
+        // env summary stays clean by default; a tenant can still flip it per rule-set via
+        // with-envs (which is injected afterwards and overrides this runtime seed).
+        if (EnvConfig.ExecutorContextLlm)
+        {
+            SetRuntime(env, prov, "XIANIX-CONTEXT-LLM", "1");
+            SetRuntime(env, prov, "XIANIX-CONTEXT-LLM-MODEL", EnvConfig.ExecutorContextLlmModel);
+        }
+
+        if (!string.IsNullOrEmpty(anthropic))
+        {
+            env["ANTHROPIC-API-KEY"]  = anthropic;
+            prov["ANTHROPIC-API-KEY"] = new EnvProvenance(
+                EnvSource.HostEnv, Detail: "ANTHROPIC-API-KEY", Resolved: true,
+                Length: anthropic.Length, Mandatory: false, Override: false);
+        }
 
         await InjectExecutionEnvVarsAsync(input.WithEnvsJson, env, prov, input.TenantId);
 
@@ -406,7 +541,7 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
         env[name]  = value;
         prov[name] = new EnvProvenance(
             EnvSource.Runtime, Detail: null, Resolved: !string.IsNullOrEmpty(value),
-            Length: value.Length, Mandatory: false, Override: false);
+            Length: value.Length, Mandatory: false, Override: false, Value: value);
     }
 
     /// <summary>
@@ -465,9 +600,13 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
 
             var isOverride = env.ContainsKey(name);
             env[name] = resolved;
+            // Only record the resolved value for `constant: true` entries — never for
+            // host.* / secrets.* references, so the env summary log can never reveal
+            // a credential value.
             prov[name] = new EnvProvenance(
                 source, detail, Resolved: !string.IsNullOrEmpty(resolved),
-                Length: resolved.Length, Mandatory: mandatory, Override: isOverride);
+                Length: resolved.Length, Mandatory: mandatory, Override: isOverride,
+                Value: source == EnvSource.Constant ? resolved : null);
         }
 
         if (missingMandatory.Count > 0)
@@ -601,6 +740,9 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
         {
             "TENANT-ID", "EXECUTION-ID", "XIANIX-INPUTS",
             "CLAUDE-CODE-PLUGINS", "PROMPT", "ANTHROPIC-API-KEY",
+            "XIANIX-MODEL", "XIANIX-MAX-TURNS", "XIANIX-DEFAULT-MAX-TURNS",
+            "XIANIX-ALLOWED-TOOLS", "XIANIX-DISALLOWED-TOOLS", "XIANIX-MAX-BUDGET-USD",
+            "XIANIX-RESUME-SESSIONS", "XIANIX-CONTEXT-LLM", "XIANIX-CONTEXT-LLM-MODEL",
         };
         var ordered = prov
             .OrderBy(kv => Array.IndexOf(runtimeOrder, kv.Key) is var idx && idx >= 0 ? idx : int.MaxValue)
@@ -620,7 +762,7 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
     private enum EnvSource { Runtime, Constant, HostEnv, Secret }
 
     /// <summary>
-    /// Captured per-env metadata used only for logging; never holds the resolved value.
+    /// Captured per-env metadata used only for logging.
     /// </summary>
     /// <param name="Detail">Source identifier — host var name (for <see cref="EnvSource.HostEnv"/>),
     /// secret key (for <see cref="EnvSource.Secret"/>), or null/empty for the others.</param>
@@ -629,14 +771,27 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
     /// sources (<see cref="EnvSource.Runtime"/>, <see cref="EnvSource.Constant"/>) so we don't
     /// fingerprint secrets via length.</param>
     /// <param name="Override">True when a rules.json entry replaced a host-seeded default.</param>
+    /// <param name="Value">Resolved value — populated ONLY for <see cref="EnvSource.Runtime"/>
+    /// and <see cref="EnvSource.Constant"/>. Always null for <see cref="EnvSource.HostEnv"/> and
+    /// <see cref="EnvSource.Secret"/> so credentials can never appear in the env summary log.</param>
     private sealed record EnvProvenance(
         EnvSource Source,
         string? Detail,
         bool Resolved,
         int Length,
         bool Mandatory,
-        bool Override)
+        bool Override,
+        string? Value = null)
     {
+        // Inline values up to this length are shown on the same line as the env entry.
+        // Longer values are rendered on a continuation block (still capped — see MaxBlockValueChars).
+        private const int MaxInlineValueChars = 80;
+
+        // Hard cap on the value text written to the log. Prevents a 50KB prompt or a
+        // huge XIANIX-INPUTS JSON from drowning out the env summary; the container itself
+        // still receives the full value untouched.
+        private const int MaxBlockValueChars = 800;
+
         public string Format(string name)
         {
             // Pad name column so columns line up in logs (longest expected key ~22 chars).
@@ -651,12 +806,15 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
                 _                  => "unknown",
             };
 
-            // For credential sources we deliberately don't log length — only resolved/empty —
-            // to avoid leaking length-based fingerprints of tenant secrets.
+            // For credential sources we deliberately do NOT log the value or its length —
+            // only resolved/empty — to avoid leaking length-based fingerprints of secrets.
+            // For Runtime / Constant entries the actual value is shown so operators can
+            // verify what the executor actually received (this is the most common cause of
+            // "why did my prompt get the wrong inputs" support tickets).
             string status = Source switch
             {
-                EnvSource.Runtime  => $"{Length} chars",
-                EnvSource.Constant => $"{Length} chars",
+                EnvSource.Runtime  => FormatValueStatus(),
+                EnvSource.Constant => FormatValueStatus(),
                 _                  => Resolved ? "set" : "EMPTY",
             };
 
@@ -666,6 +824,22 @@ public class ContainerActivities : IDisposable, IAsyncDisposable
             var flagSuffix = flags.Count == 0 ? "" : " [" + string.Join(",", flags) + "]";
 
             return $"{paddedName} <- {sourceLabel,-32} ({status}){flagSuffix}";
+        }
+
+        private string FormatValueStatus()
+        {
+            if (Length == 0 || string.IsNullOrEmpty(Value))
+                return "0 chars: <empty>";
+
+            var hasNewline = Value.Contains('\n') || Value.Contains('\r');
+            if (!hasNewline && Length <= MaxInlineValueChars)
+                return $"{Length} chars: {Value}";
+
+            // Long or multi-line value — render on a continuation block, indented to
+            // line up under the value column for grep-friendly output.
+            var truncated = Length <= MaxBlockValueChars ? Value : Value[..MaxBlockValueChars] + "…";
+            var indented  = truncated.Replace("\r\n", "\n").Replace("\n", "\n      ");
+            return $"{Length} chars:\n      {indented}";
         }
     }
 

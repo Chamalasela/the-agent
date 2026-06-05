@@ -1,6 +1,3 @@
-using System.Text.Json;
-using Xians.Lib.Agents.Core;
-
 namespace Xianix.Rules;
 
 /// <summary>
@@ -45,41 +42,20 @@ internal static class AvailablePluginsCatalog
     /// </summary>
     public const string GitRefInput = "git-ref";
 
-    private static readonly JsonSerializerOptions RulesJsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-    };
-
     /// <summary>
-    /// Loads <c>rules.json</c> from Xians Knowledge and returns one <see cref="CatalogPlugin"/>
-    /// per unique <c>plugin-name@marketplace</c> pair, aggregating every execution block that
-    /// references it so the model can see every way the plugin is normally invoked along with
-    /// the inputs each invocation needs.
+    /// Loads <c>rules.json</c> via the canonical <see cref="RulesKnowledge.LoadAsync"/>
+    /// reader and returns one <see cref="CatalogPlugin"/> per unique
+    /// <c>plugin-name@marketplace</c> pair, aggregating every execution block that
+    /// references it so the model can see every way the plugin is normally invoked
+    /// along with the inputs each invocation needs.
     /// </summary>
     /// <returns>An empty list when the rules knowledge document is missing or unparseable.</returns>
     public static async Task<IReadOnlyList<CatalogPlugin>> LoadAsync()
     {
-        var knowledge = await XiansContext.CurrentAgent.Knowledge
-            .GetAsync(Constants.RulesKnowledgeName)
-            .ConfigureAwait(false);
-
-        if (knowledge is null || string.IsNullOrWhiteSpace(knowledge.Content))
-            return [];
-
-        List<WebhookRuleSet> ruleSets;
-        try
-        {
-            ruleSets = JsonSerializer
-                .Deserialize<List<WebhookRuleSet>>(knowledge.Content, RulesJsonOptions) ?? [];
-        }
-        catch (JsonException)
-        {
-            return [];
-        }
-
-        return BuildCatalog(ruleSets);
+        // Treat "missing" and "empty" identically here — a chat session with no rules
+        // should still get a tool result of "no plugins available" rather than blow up.
+        var ruleSets = await RulesKnowledge.LoadAsync().ConfigureAwait(false);
+        return BuildCatalog(ruleSets ?? []);
     }
 
     /// <summary>
@@ -95,6 +71,10 @@ internal static class AvailablePluginsCatalog
 
         foreach (var set in ruleSets)
         {
+            // Rule-set-wide common envs apply to every execution in this rule set, so a
+            // plugin used by any execution in this rule set may need them. Pass them
+            // through to AddUsage so they accumulate into the plugin's RequiredEnvs
+            // alongside the execution-level envs (still deduped first-wins by env name).
             foreach (var execution in set.Executions)
             {
                 foreach (var plugin in execution.Plugins)
@@ -108,7 +88,7 @@ internal static class AvailablePluginsCatalog
                         builder = new CatalogPluginBuilder(plugin);
                         byKey[key] = builder;
                     }
-                    builder.AddUsage(execution);
+                    builder.AddUsage(execution, set.WithEnvs);
                 }
             }
         }
@@ -183,21 +163,15 @@ internal static class AvailablePluginsCatalog
         // keep one entry.
         private readonly Dictionary<string, EnvEntry> _envs = new(StringComparer.Ordinal);
 
-        // Per-platform breakdown of with-envs, so the chat tool can ship only the credentials
-        // a given dispatch actually needs (rather than the union of every platform the plugin
-        // happens to support). Keys are normalised to lowercase platform identifiers from
-        // <c>WebhookExecution.Platform</c> ("github", "azuredevops", or "" for executions
-        // without a platform binding). Within a key, dedup is by env name (first-wins).
-        private readonly Dictionary<string, Dictionary<string, EnvEntry>> _envsByPlatform =
-            new(StringComparer.Ordinal);
-
         public CatalogPluginBuilder(PluginEntry source)
         {
             _source = source;
         }
 
-        public void AddUsage(WebhookExecution execution)
+        public void AddUsage(WebhookExecution execution, IReadOnlyList<EnvEntry> ruleSetCommonEnvs)
         {
+            ArgumentNullException.ThrowIfNull(ruleSetCommonEnvs);
+
             var inputs = new List<CatalogInputRequirement>();
 
             // Synthesise structural execution context as catalog inputs so the chat-side
@@ -256,18 +230,20 @@ internal static class AvailablePluginsCatalog
                 ExecutePrompt: execution.Prompt?.Trim() ?? "",
                 Inputs:        inputs));
 
-            var platformKey = (execution.Platform ?? string.Empty).Trim().ToLowerInvariant();
-            if (!_envsByPlatform.TryGetValue(platformKey, out var platformEnvs))
+            // Rule-set common envs first (so an execution-level entry with the same name
+            // would still win on first-wins dedup if it were added before this rule-set's
+            // common entries on a prior pass — kept consistent with the merge order in
+            // WebhookRulesEvaluator.MergeWithEnvs at evaluation time).
+            foreach (var env in ruleSetCommonEnvs)
             {
-                platformEnvs = new Dictionary<string, EnvEntry>(StringComparer.Ordinal);
-                _envsByPlatform[platformKey] = platformEnvs;
+                if (string.IsNullOrWhiteSpace(env.Name)) continue;
+                _envs.TryAdd(env.Name, env);
             }
 
             foreach (var env in execution.WithEnvs)
             {
                 if (string.IsNullOrWhiteSpace(env.Name)) continue;
                 _envs.TryAdd(env.Name, env);
-                platformEnvs.TryAdd(env.Name, env);
             }
         }
 
@@ -309,10 +285,6 @@ internal static class AvailablePluginsCatalog
             RequiredEnvs:    _envs.Values
                 .Select(e => new CatalogEnvRequirement(e.Name, e.Mandatory))
                 .ToList(),
-            EnvsByPlatform:  _envsByPlatform.ToDictionary(
-                kv => kv.Key,
-                kv => (IReadOnlyList<EnvEntry>)kv.Value.Values.ToList(),
-                StringComparer.Ordinal),
             UsageExamples:   _usages,
             Source:          _source);
     }
@@ -324,15 +296,9 @@ internal static class AvailablePluginsCatalog
 /// </summary>
 /// <param name="RequiredEnvs">Names + mandatory flags of every env declared on at least one
 /// execution that uses this plugin. Surfaced to the model so it knows which envs the tenant
-/// must have configured (typically via <c>secrets.*</c>).</param>
-/// <param name="EnvsByPlatform">The full <see cref="EnvEntry"/> records (with values like
-/// <c>secrets.GITHUB-TOKEN</c>) grouped by the <see cref="WebhookExecution.Platform"/> of
-/// the executions that declared them. Keys are normalised to lowercase
-/// (<c>"github"</c>, <c>"azuredevops"</c>, or <c>""</c> for platform-agnostic executions).
-/// <c>RunClaudeCodeOnRepository</c> uses this to forward only the credentials a given
-/// dispatch actually needs — so a GitHub-targeted run does not get blocked by an Azure
-/// DevOps PAT requirement that the same plugin happens to declare on its ADO usage.
-/// Within a key, dedup is by env name. Not surfaced to the model.</param>
+/// must have configured (typically via <c>secrets.*</c>). The actual env values forwarded to
+/// a chat dispatch are sourced rule-wide via <see cref="RulesEnvCatalog"/> — this list is
+/// purely informational for the catalog UI.</param>
 /// <param name="Source">The original <see cref="PluginEntry"/> from <c>rules.json</c>; used
 /// internally by <c>RunClaudeCodeOnRepository</c> to forward the plugin spec to the
 /// container. Not surfaced to the model.</param>
@@ -340,7 +306,6 @@ internal sealed record CatalogPlugin(
     string PluginName,
     string Marketplace,
     IReadOnlyList<CatalogEnvRequirement> RequiredEnvs,
-    IReadOnlyDictionary<string, IReadOnlyList<EnvEntry>> EnvsByPlatform,
     IReadOnlyList<CatalogUsageExample> UsageExamples,
     PluginEntry Source);
 

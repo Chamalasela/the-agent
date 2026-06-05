@@ -10,12 +10,27 @@ public static class EnvConfig
     /// <summary>
     /// Validates that all critical environment variables are present at startup.
     /// Call once after <see cref="Load"/> to fail fast before any work begins.
+    ///
+    /// Only the Xians platform credentials are gated here — without them the agent
+    /// cannot even register with the platform or upload its knowledge documents,
+    /// so there is nothing useful it could do.
+    ///
+    /// <c>ANTHROPIC-API-KEY</c> is deliberately <em>not</em> in this list. It is
+    /// resolved lazily on the supervisor's first chat message via
+    /// <see cref="Xianix.Rules.StartupEnvResolver.TryResolveValueAsync"/>, which
+    /// consults the rule-set-level <c>with-envs</c> entry in the uploaded
+    /// <c>rules.json</c> first and falls back to the host env when present. That
+    /// lets operators manage the Anthropic key entirely from <c>rules.json</c> and
+    /// run the agent host without it (e.g. when the secret has been removed from
+    /// Key Vault). The supervisor surfaces a loud, user-visible chat error if no
+    /// source resolves at first message time — see
+    /// <see cref="Xianix.Agent.SupervisorSubagent"/>'s lazy init.
     /// </summary>
     /// <exception cref="InvalidOperationException">When one or more required variables are missing.</exception>
     public static void ValidateRequiredVariables()
     {
-        string[] requiredKeys = ["XIANS-SERVER-URL", "XIANS-API-KEY", "ANTHROPIC-API-KEY"];
-        var missing = requiredKeys
+        string[] requiredHostKeys = ["XIANS-SERVER-URL", "XIANS-API-KEY"];
+        var missing = requiredHostKeys
             .Where(k => string.IsNullOrWhiteSpace(Resolve(k)))
             .ToList();
 
@@ -57,7 +72,17 @@ public static class EnvConfig
     public static string AgentName => Get("AGENT-NAME", Xianix.Constants.AgentName);
 
     // LLM / Anthropic
-    public static string AnthropicApiKey         => GetRequired("ANTHROPIC-API-KEY");
+    //
+    // Returns the host env value if set, otherwise an empty string. The Anthropic key
+    // is intentionally NOT required at startup — the supervisor subagent consults the
+    // rule-set-level `with-envs` entry from the uploaded rules.json on its first chat
+    // message first (see <see cref="Xianix.Rules.StartupEnvResolver"/> and the lazy
+    // init in <see cref="Xianix.Agent.SupervisorSubagent"/>), and falls back to this
+    // host value only when no rules.json entry resolves. Callers that need a hard
+    // throw on empty (e.g. <see cref="Xianix.Activities.ContainerActivities"/>'s
+    // container seed) must check for an empty string themselves and decide whether
+    // to surface a user-visible error or skip the env entirely.
+    public static string AnthropicApiKey => Get("ANTHROPIC-API-KEY");
     public static string AnthropicDeploymentName => Get("ANTHROPIC-DEPLOYMENT-NAME", "claude-haiku-4-5");
 
     // CM platform tokens (GITHUB-TOKEN, AZURE-DEVOPS-TOKEN, etc.) are NOT read from the host
@@ -79,4 +104,36 @@ public static class EnvConfig
     /// </summary>
     public static int ContainerExecutionTimeoutSeconds =>
         int.TryParse(Get("CONTAINER-EXECUTION-TIMEOUT-SECONDS", "900"), out var v) && v > 0 ? v : 1800;
+
+    /// <summary>
+    /// Host-wide default cap on agent turns, applied by the executor when a rule doesn't set
+    /// its own <c>max-turns</c>. A token backstop against runaway loops (which would otherwise
+    /// only be stopped by the wall-clock timeout). Defaults to <c>0</c> = no cap, preserving
+    /// existing behaviour; set a positive value to enable the backstop fleet-wide. Per-execution
+    /// <c>max-turns</c> in rules.json always wins.
+    /// </summary>
+    public static int ExecutorDefaultMaxTurns =>
+        int.TryParse(Get("EXECUTOR-DEFAULT-MAX-TURNS", "0"), out var v) && v > 0 ? v : 0;
+
+    /// <summary>
+    /// Host-wide opt-in for the hybrid context pass: when enabled, the executor appends an
+    /// LLM-authored "Architecture &amp; conventions" narrative to the auto-generated
+    /// <c>CLAUDE.md</c> (on top of the always-on deterministic facts + symbol map). The pass
+    /// runs only on a context cache miss — i.e. once per repo HEAD change — so its (small,
+    /// Haiku-priced) cost is amortised across every later run that reuses
+    /// the cache, and it is skipped entirely when the repo ships its own <c>CLAUDE.md</c>. The
+    /// pass is bounded by a turn cap and a wall-clock timeout, and any failure (no key, timeout,
+    /// empty output) silently falls back to the deterministic-only <c>CLAUDE.md</c>.
+    /// Defaults to <c>false</c>. This is a host/per-repo knob rather than a per-execution one
+    /// because the context cache is shared per repository; a tenant can still override per
+    /// rule-set by setting <c>XIANIX-CONTEXT-LLM</c> in <c>with-envs</c>.
+    /// </summary>
+    public static bool ExecutorContextLlm =>
+        Get("EXECUTOR-CONTEXT-LLM", "false").Trim().ToLowerInvariant() is "1" or "true" or "yes" or "on";
+
+    /// <summary>
+    /// Model used for the optional context narrative pass (see <see cref="ExecutorContextLlm"/>).
+    /// Defaults to the cheapest tier so building context never becomes a meaningful cost line.
+    /// </summary>
+    public static string ExecutorContextLlmModel => Get("EXECUTOR-CONTEXT-LLM-MODEL", "claude-haiku-4-5");
 }

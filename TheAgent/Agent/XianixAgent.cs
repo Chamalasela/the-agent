@@ -1,6 +1,8 @@
 using Microsoft.Extensions.Logging;
 using TheAgent;
 using Xianix.Activities;
+using Xianix.Orchestrator;
+using Xianix.Rules;
 using Xianix.Workflows;
 using Xianix.Orchestrator;
 using Xians.Lib.Agents.Core;
@@ -37,8 +39,33 @@ public class XianixAgent(
     {
         var conversationWorkflow = xiansAgent.Workflows.DefineSupervisor();
 
+        // The Anthropic key resolver runs on the supervisor's first message per
+        // tenant (SupervisorSubagent caches one AIAgent per TenantId; see
+        // EnsureAgentForTenantAsync there). At that point XiansContext.CurrentAgent
+        // is bound to the calling message's tenant — the platform scopes it via
+        // AsyncLocal — so all of the resolver's reads happen against the right
+        // tenant: rules.json comes from XiansContext.CurrentAgent.Knowledge and any
+        // `secrets.*` entry is fetched from XiansContext.CurrentAgent.Secrets.TenantScope().
+        //
+        // Resolution order, identical to the container path's `with-envs` merge:
+        //   1. Rule-set-level `with-envs` entry named `ANTHROPIC-API-KEY` in rules.json
+        //      — constant / host.VAR / secrets.KEY all supported. Operators normally
+        //      declare it once at the top of rules.json (same pattern they already
+        //      use for GITHUB-TOKEN).
+        //   2. Host env `ANTHROPIC-API-KEY` (or `ANTHROPIC_API_KEY`) — fallback when
+        //      the rules.json entry is absent, points at an unset host var, or the
+        //      tenant's Secret Vault has no entry under the configured key.
+        //   3. Empty — SupervisorSubagent surfaces a loud, tenant-tagged error which
+        //      OnUserChatMessage's catch logs and replies to the user.
+        async Task<string> ResolveAnthropicApiKeyAsync()
+        {
+            var resolved = await StartupEnvResolver.TryResolveValueAsync("ANTHROPIC-API-KEY", logger)
+                .ConfigureAwait(false);
+            return resolved ?? EnvConfig.AnthropicApiKey;
+        }
+
         var subagent = new SupervisorSubagent(
-            EnvConfig.AnthropicApiKey,
+            ResolveAnthropicApiKeyAsync,
             EnvConfig.AnthropicDeploymentName,
             supervisorLogger,
             supervisorToolsLogger,

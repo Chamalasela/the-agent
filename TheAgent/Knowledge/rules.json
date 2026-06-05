@@ -1,6 +1,13 @@
 [
     {
         "webhook": "Default",
+        "with-envs": [
+            {
+                "name": "GITHUB-TOKEN",
+                "value": "secrets.GITHUB-TOKEN",
+                "mandatory": true
+            }
+        ],
         "executions": [
             {
                 "name": "github-pull-request-review",
@@ -35,13 +42,8 @@
                         "marketplace": "xianix-team/plugins-official"
                     }
                 ],
-                "with-envs": [
-                    {
-                        "name": "GITHUB-TOKEN",
-                        "value": "secrets.GITHUB-TOKEN",
-                        "mandatory": true
-                    }
-                ],
+                "model": "claude-sonnet-4-5",
+                "max-budget-usd": 3.0,
                 "execute-prompt": "You are reviewing pull request {{pr-link}}. Run /pr-review to perform the automated review."
             },
             {
@@ -84,6 +86,8 @@
                         "mandatory": true
                     }
                 ],
+                "model": "claude-sonnet-4-5",
+                "max-budget-usd": 5.0,
                 "execute-prompt": "You are reviewing pull request #{{pr-number}} in the repository {{repository-name}} (branch: {{git-ref}}).\n\nRun /pr-review to perform the automated review. "
             },
             {
@@ -111,13 +115,7 @@
                         "marketplace": "xianix-team/plugins-official"
                     }
                 ],
-                "with-envs": [
-                    {
-                        "name": "GITHUB-TOKEN",
-                        "value": "secrets.GITHUB-TOKEN",
-                        "mandatory": true
-                    }
-                ],
+                "model": "claude-haiku-4-5",
                 "execute-prompt": "Issue #{{issue-number}} in the repository {{repository-name}} has been assigned to xianix-agent for requirement analysis.\n\nRun /requirement-analysis {{issue-number}} to perform the automated requirement analysis and elaboration."
             },
             {
@@ -146,6 +144,11 @@
                         "name": "AZURE-DEVOPS-TOKEN",
                         "value": "secrets.AZURE-DEVOPS-TOKEN",
                         "mandatory": true
+                    },
+                    {
+                        "name": "ANTHROPIC-MODEL",
+                        "value": "claude-haiku-4-5",
+                        "constant": true
                     }
                 ],
                 "execute-prompt": "Work item #{{workitem-id}} has been assigned to xianix-agent for requirement analysis.\n\nRun /requirement-analysis {{workitem-id}} to perform the automated requirement analysis and elaboration."

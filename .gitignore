@@ -58,3 +58,6 @@ TestResult.xml
 nunit-*.xml
 id_rsa
 TheAgent/.env.production
+
+# Local History for Visual Studio
+*.lscache

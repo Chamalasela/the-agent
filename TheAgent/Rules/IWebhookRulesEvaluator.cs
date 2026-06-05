@@ -32,7 +32,13 @@ public sealed record EvaluationResult(
     string Platform = "",
     string RepositoryUrl = "",
     string RepositoryName = "",
-    string GitRef = "");
+    string GitRef = "",
+    string Model = "",
+    int? MaxTurns = null,
+    IReadOnlyList<string>? AllowedTools = null,
+    IReadOnlyList<string>? DisallowedTools = null,
+    double? MaxBudgetUsd = null,
+    bool ResumeSessions = false);
 
 /// <summary>
 /// Outcome of a rules evaluation: zero or more matching execution blocks, or a skip reason.

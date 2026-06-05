@@ -18,6 +18,7 @@ In **this repository**, the default rules are embedded from [`TheAgent/Knowledge
 [
   {
     "webhook": "...",
+    "with-envs": [ ... ],
     "executions": [
       {
         "name": "...",
@@ -41,6 +42,7 @@ In **this repository**, the default rules are embedded from [`TheAgent/Knowledge
 | Field | Description |
 |-------|-------------|
 | `webhook` | Webhook name from Xians Agent Studio (must match incoming events) |
+| `with-envs` (optional, on the rule set) | Rule-set-wide [common environment variables](#5-with-envs--container-environment-variables) injected into every execution in this rule set. Per-execution `with-envs` entries override these by env name. |
 | `executions` | One or more execution blocks |
 | `platform` (optional, on each execution) | Hosting service the execution operates against (`github`, `azuredevops`, …). Structural — describes *where* the run happens, independent of the plugin. Auto-injected into `XIANIX_INPUTS` as `"platform"` for plugin prompts. Omit for executions that don't target a specific platform. |
 | `repository` (optional, on each execution) | Structural binding for the repository being operated on. Every sub-field that is declared (`url`, `ref`) is treated as **mandatory** — if any declared path doesn't resolve, the block is skipped before any container starts. Auto-injected as `"repository-url"` / `"git-ref"`, with `"repository-name"` derived from `repository.url` and injected alongside them. Omit entirely for executions that don't operate on a specific repo (e.g. work-item analysis). |
@@ -324,12 +326,41 @@ Declares Claude Code marketplace plugins to install in the executor container be
 
 ## 5. `with-envs` — Container environment variables
 
-Declares environment variables to inject into the executor container before the prompt runs. Sits at the **execution-block** level (sibling to `use-plugins`) — every variable is available to every plugin and to the prompt itself, regardless of how many plugins consume it.
+Declares environment variables to inject into the executor container before the prompt runs. `with-envs` can be authored at **two levels**:
 
-```json
-"with-envs": [
-  { "name": "GITHUB-TOKEN",       "value": "secrets.GITHUB-TOKEN", "mandatory": true },
-  { "name": "FEATURE-FLAG-MODE",  "value": "strict",               "constant": true }
+1. **Rule-set level** (sibling to `webhook` / `executions`) — *common* envs that apply to **every** execution in the rule set. Use these to declare credentials or settings every execution shares so the same line doesn't have to be repeated on each block. Per-execution `with-envs` entries can override these by env name (same name → execution-level wins).
+2. **Execution-block level** (sibling to `use-plugins`) — envs specific to one execution. Layered on top of the rule-set-level common envs.
+
+```jsonc
+[
+  {
+    "webhook": "Default",
+    "with-envs": [
+      // Common to every execution in this rule set — no need to repeat per execution.
+      { "name": "GITHUB-TOKEN", "value": "secrets.GITHUB-TOKEN", "mandatory": true }
+    ],
+    "executions": [
+      {
+        "name": "azuredevops-pull-request-review",
+        "platform": "azuredevops",
+        "with-envs": [
+          // Adds an Azure DevOps PAT only to this execution. The rule-set-level
+          // GITHUB-TOKEN is still injected here too.
+          { "name": "AZURE-DEVOPS-TOKEN", "value": "secrets.AZURE-DEVOPS-TOKEN", "mandatory": true }
+        ],
+        // …
+      },
+      {
+        "name": "feature-flag-experiment",
+        "with-envs": [
+          // Same NAME as the rule-set entry → this execution-level override wins.
+          { "name": "GITHUB-TOKEN", "value": "secrets.GITHUB-TOKEN-LEGACY", "mandatory": true },
+          { "name": "FEATURE-FLAG-MODE", "value": "strict", "constant": true }
+        ],
+        // …
+      }
+    ]
+  }
 ]
 ```
 
@@ -340,9 +371,47 @@ Declares environment variables to inject into the executor container before the 
 | `constant`  | *(optional)* Treat `value` as a literal |
 | `mandatory` | *(optional, default `false`)* When `true`, the executor container **fails to start** (non-retryable) if this env resolves to `null` or empty. Use for credentials the prompt cannot run without. |
 
+### Override semantics (rule-set vs execution)
+
+The two levels are merged **before** the container starts:
+
+- Every rule-set-level entry is included unless an execution declares an entry with the same `name`.
+- Execution-level entries always win on a name collision — both `value` and `mandatory` are taken from the execution-level entry. The rule-set-level entry is dropped for that execution (so a rule-set `mandatory: true` can't trip the missing-mandatory check after the execution has explicitly overridden it).
+- The emitted order is "common defaults first, per-execution last" — operator-friendly when scanning the env-provenance log.
+
+Examples:
+
+| Rule-set declares                                              | Execution declares                                                    | Effective env list for this run                                              |
+|----------------------------------------------------------------|------------------------------------------------------------------------|------------------------------------------------------------------------------|
+| `GITHUB-TOKEN` (secrets.X, mandatory)                          | *(no `with-envs`)*                                                     | `GITHUB-TOKEN=secrets.X` (mandatory)                                         |
+| `GITHUB-TOKEN` (secrets.X, mandatory)                          | `AZURE-DEVOPS-TOKEN` (secrets.Y, mandatory)                            | `GITHUB-TOKEN=secrets.X` (mandatory), `AZURE-DEVOPS-TOKEN=secrets.Y` (mand.) |
+| `GITHUB-TOKEN` (secrets.X, mandatory)                          | `GITHUB-TOKEN` (secrets.Z, optional) — same name, override             | `GITHUB-TOKEN=secrets.Z` (optional) — execution wins                         |
+
+### Chat-driven runs
+
+The same `with-envs` declarations also flow through to **chat-initiated** runs (e.g. when a user asks the agent to run a plugin via `RunClaudeCodeOnRepository` instead of via a webhook). A chat dispatch doesn't bind to a specific execution block, so the chat tool reads `rules.json` as the manifest of *every* credential the agent could need and ships:
+
+- **Every rule-set-level `with-envs` entry** — applied unconditionally, regardless of platform. This is precisely the "common defaults" contract: a `GITHUB-TOKEN` declared at the rule-set level is available to chat runs the same way it's available to every execution.
+- **Per-execution `with-envs` entries** whose execution matches the chosen repository's platform (or is platform-agnostic) — kept under the platform filter so a GitHub-targeted chat run doesn't inherit Azure DevOps's mandatory PAT and vice versa.
+
+Both lists are then deduped by env name. The platform filter intentionally does *not* apply to rule-set commons — if you want a credential to be platform-specific, declare it under the matching execution(s), not at the rule-set level.
+
 ### Resolution precedence
 
-Only `ANTHROPIC-API-KEY` is seeded into the container from the host `.env` (it's also required for the agent process itself). All CM platform credentials — `GITHUB-TOKEN`, `AZURE-DEVOPS-TOKEN`, anything else — are **not** read from the host: each tenant must store their own in the Xians Secret Vault and reference it from `rules.json` via `"value": "secrets.<KEY>"`. `with-envs` entries are layered on top of the host-derived defaults at container-start time, so any `secrets.*` or `host.*` entry in `rules.json` overrides whatever was seeded.
+When the host `.env` (or Key Vault on the deployed VM) declares `ANTHROPIC-API-KEY`, that value is seeded into the executor container as a default. If the host does **not** declare it, no seed is emitted and the container is expected to receive the key from a `with-envs` entry in `rules.json` instead. All CM platform credentials — `GITHUB-TOKEN`, `AZURE-DEVOPS-TOKEN`, anything else — are **not** read from the host: each tenant must store their own in the Xians Secret Vault and reference it from `rules.json` via `"value": "secrets.<KEY>"`. `with-envs` entries are layered on top of the host-derived defaults at container-start time, so any `secrets.*` or `host.*` entry in `rules.json` overrides whatever was seeded.
+
+### Agent-process credentials (e.g. `ANTHROPIC-API-KEY`)
+
+Some credentials are consumed by the agent process itself, not just the container — `ANTHROPIC-API-KEY` is the headline example (the supervisor chat subagent calls Claude directly). For those, the rule-set-level `with-envs` is honoured on the supervisor's **first chat message per tenant** with a "rules-first, host-fallback" policy implemented by `StartupEnvResolver`:
+
+1. On the first incoming chat message for a given tenant, the supervisor reads the uploaded `rules.json` knowledge document via the canonical `RulesKnowledge.LoadAsync` reader (same call site every other rules consumer uses) and walks every rule set's top-level `with-envs`. Match is by exact `name`, first-wins across rule sets.
+2. If a matching entry is found, it is resolved against the **current tenant's** scope (`XiansContext.CurrentAgent` is bound to the calling message's tenant via AsyncLocal at that point):
+   - `"constant": true` → value taken verbatim.
+   - `"value": "host.VAR_NAME"` → looked up on the host process env.
+   - `"value": "secrets.SECRET-KEY"` → fetched from the **tenant-scoped Xians Secret Vault** (`XiansContext.CurrentAgent.Secrets.TenantScope().FetchByKeyAsync(...)`). Each tenant therefore plugs in their own API key; the supervisor caches one `AIAgent` per tenant so each gets their own `AnthropicClient`. A missing vault entry resolves to `null` and the resolver falls back to the host env — same semantics as the container path.
+3. If resolution fails or no entry is declared, the supervisor falls back to the host env var of the same name (`EnvConfig.AnthropicApiKey`).
+
+The host env var is **optional**. `EnvConfig.ValidateRequiredVariables()` gates only the Xians platform credentials (`XIANS-SERVER-URL`, `XIANS-API-KEY`) so the agent can register and upload knowledge before any chat traffic arrives — Anthropic key absence does not block boot. If neither the rule-set-level entry nor the host env resolves at first-message time, the supervisor raises a clear `Anthropic API key resolver returned an empty value for tenant '<tenant>'` error which the conversation workflow logs and surfaces to the user as a generic apology; fix it by adding either a rule-set-level `with-envs` entry (constant / `host.*` / `secrets.*`) or a host env value. No restart needed — `SupervisorSubagent.EnsureAgentForTenantAsync` only caches successful constructions, so the next message from that tenant retries the resolver. When a host value is present, a rule-set-level `ANTHROPIC-API-KEY` entry in `rules.json` *overrides* it on the first chat message per tenant, after which the resolved `AnthropicClient` is cached for the lifetime of the process *for that tenant*. The container path also picks up rule-set commons via the normal `with-envs` merge, so the same declaration covers both the supervisor and every executor run.
 
 ### Resolving `secrets.*`
 
@@ -375,6 +444,9 @@ Placeholders are replaced case-insensitively. Any `{{name}}` with no matching in
 [
   {
     "webhook": "Default",
+    "with-envs": [
+      { "name": "GITHUB-TOKEN", "value": "secrets.GITHUB-TOKEN", "mandatory": true }
+    ],
     "executions": [
       {
         "name": "github-pull-request-review",
@@ -396,15 +468,14 @@ Placeholders are replaced case-insensitively. Any `{{name}}` with no matching in
             "marketplace": "xianix-team/plugins-official"
           }
         ],
-        "with-envs": [
-          { "name": "GITHUB-TOKEN", "value": "secrets.GITHUB-TOKEN", "mandatory": true }
-        ],
         "execute-prompt": "You are reviewing pull request #{{pr-number}} titled \"{{pr-title}}\" in the repository {{repository-name}} (branch: {{git-ref}}).\n\nRun /code-review to perform the automated review. The `gh` CLI is authenticated and available if you need it directly."
       }
     ]
   }
 ]
 ```
+
+`GITHUB-TOKEN` is declared once at the rule-set level so every execution under `Default` picks it up — there's no need to repeat the env entry on each execution. An Azure DevOps execution sharing the same rule set would simply add its `AZURE-DEVOPS-TOKEN` under its own `with-envs` block.
 
 ### Work-item example (no repository)
 
@@ -444,5 +515,5 @@ When the run doesn't operate on a specific repo, just omit the `repository` bloc
 3. The structural fields (`platform`, `repository.url`, `repository.ref`) are resolved alongside `use-inputs`. Any declared structural field that fails to resolve **skips the block** with a clear error — same code path as a missing mandatory input.
 4. The resolved structural values are auto-injected into the inputs dictionary as `platform`, `repository-url`, and `git-ref`. The short `repository-name` (e.g. `owner/repo`) is **derived** from `repository-url` via `RepositoryNaming.DeriveName` (platform-aware: handles GitHub, Azure DevOps `_git` URLs, etc.) and injected alongside them — these are the canonical wire-format keys plugin prompts and the executor entrypoint expect.
 5. `execute-prompt` is interpolated against the merged inputs dict.
-6. The agent resolves `with-envs` (literals, `host.*`, `secrets.*`) and injects them into the executor container alongside the runtime values it manages itself.
+6. The agent merges rule-set-level common `with-envs` with the matched execution's own `with-envs` (execution-level entries override rule-set entries by env name), resolves each entry (literals, `host.*`, `secrets.*`), and injects them into the executor container alongside the runtime values it manages itself.
 7. The executor uses `platform` to pick the right credential helper, `git clone`s `repository-url` into the per-tenant workspace volume, checks out `git-ref` into the per-run worktree (or HEAD when omitted), installs `use-plugins`, and runs the prompt.

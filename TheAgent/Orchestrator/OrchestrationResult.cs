@@ -144,6 +144,27 @@ public sealed class ExecutionSpec
 
     public string Prompt { get; init; } = string.Empty;
 
+    /// <summary>
+    /// Optional Claude model the executor should run on for this execution. Empty means
+    /// "use the executor's configured default". Flows to the container as <c>XIANIX-MODEL</c>.
+    /// </summary>
+    public string Model { get; init; } = string.Empty;
+
+    /// <summary>Optional hard cap on agent turns; null means no cap. Flows as <c>XIANIX-MAX-TURNS</c>.</summary>
+    public int? MaxTurns { get; init; }
+
+    /// <summary>Optional tool allow-list; empty means no restriction. Flows as <c>XIANIX-ALLOWED-TOOLS</c>.</summary>
+    public List<string> AllowedTools { get; init; } = [];
+
+    /// <summary>Optional tool deny-list; empty means no restriction. Flows as <c>XIANIX-DISALLOWED-TOOLS</c>.</summary>
+    public List<string> DisallowedTools { get; init; } = [];
+
+    /// <summary>Optional hard spend cap (USD); null means no cap. Flows as <c>XIANIX-MAX-BUDGET-USD</c>.</summary>
+    public double? MaxBudgetUsd { get; init; }
+
+    /// <summary>When true, resume the prior session for this conversation. Flows as <c>XIANIX-RESUME-SESSIONS</c>.</summary>
+    public bool ResumeSessions { get; init; }
+
     public ExecutionSpec() { }
 
     public ExecutionSpec(
@@ -153,14 +174,26 @@ public sealed class ExecutionSpec
         string platform = "",
         string repositoryUrl = "",
         string repositoryName = "",
-        string gitRef = "")
+        string gitRef = "",
+        string model = "",
+        int? maxTurns = null,
+        IReadOnlyList<string>? allowedTools = null,
+        IReadOnlyList<string>? disallowedTools = null,
+        double? maxBudgetUsd = null,
+        bool resumeSessions = false)
     {
-        Plugins        = [.. plugins];
-        WithEnvs       = withEnvs is null ? [] : [.. withEnvs];
-        Prompt         = prompt;
-        Platform       = platform ?? "";
-        RepositoryUrl  = repositoryUrl ?? "";
-        RepositoryName = repositoryName ?? "";
-        GitRef         = gitRef ?? "";
+        Plugins         = [.. plugins];
+        WithEnvs        = withEnvs is null ? [] : [.. withEnvs];
+        Prompt          = prompt;
+        Platform        = platform ?? "";
+        RepositoryUrl   = repositoryUrl ?? "";
+        RepositoryName  = repositoryName ?? "";
+        GitRef          = gitRef ?? "";
+        Model           = model ?? "";
+        MaxTurns        = maxTurns;
+        AllowedTools    = allowedTools is null ? [] : [.. allowedTools];
+        DisallowedTools = disallowedTools is null ? [] : [.. disallowedTools];
+        MaxBudgetUsd    = maxBudgetUsd;
+        ResumeSessions  = resumeSessions;
     }
 }

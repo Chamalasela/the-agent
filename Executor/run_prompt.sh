@@ -31,6 +31,18 @@ fi
 cd "${WORK_DIR}"
 log "--- Workspace ready at ${WORK_DIR} ---"
 
+# ── Persist Claude Code config/session store across runs ─────────────────────
+# By default Claude Code keeps settings, credentials, and session history under ~/.claude,
+# which is wiped with every ephemeral container. Relocating it onto the tenant volume lets
+# back-to-back runs (e.g. PR re-reviews on `synchronize`) reuse prior session history for
+# session resume, and keeps the prompt prefix stable across runs so Anthropic prompt caching
+# can hit. Only done when a repo volume is mounted (no volume = nothing to persist to).
+if [ -n "${REPOSITORY_URL:-}" ] && [ -d "${REPO_DIR}" ]; then
+    export CLAUDE_CONFIG_DIR="${REPO_DIR}/xianix-claude-config"
+    mkdir -p "${CLAUDE_CONFIG_DIR}" 2>/dev/null || true
+    log "Claude config dir (persistent): ${CLAUDE_CONFIG_DIR}"
+fi
+
 # ── Install plugins ──────────────────────────────────────────────────────────
 # Each entry is a JSON object: { "plugin-name", "marketplace"? }
 #
@@ -91,6 +103,15 @@ if [ -n "${CLAUDE_CODE_PLUGINS:-}" ] && [ "${CLAUDE_CODE_PLUGINS}" != "[]" ]; th
         fi
     done
     log "--- Plugin installation complete ---"
+fi
+
+# ── Prepare cached repo context (CLAUDE.md + symbol map) ─────────────────────
+# Deterministic, token-free orientation cached on the volume and injected into the worktree
+# so the agent doesn't re-explore the codebase from scratch. Best-effort: never fails the run.
+if [ -n "${REPOSITORY_URL:-}" ]; then
+    log "--- Preparing repo context (CLAUDE.md + symbol map) ---"
+    "${SCRIPT_DIR}/generate_context.sh" "${WORK_DIR}" "${REPO_DIR}/xianix-context" \
+        || log "WARNING: context generation failed — continuing without it."
 fi
 
 # ── Execute the Claude Code prompt ──────────────────────────────────────────

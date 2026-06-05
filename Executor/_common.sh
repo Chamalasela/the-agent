@@ -49,26 +49,69 @@ GIT_CRED_FILE="/tmp/.git-credentials"
 export REPO_DIR WORK_DIR GIT_CRED_FILE
 
 # ── Platform-specific credential & URL setup ─────────────────────────────────
+# Strip surrounding whitespace/CR/LF from a token. Vault-stored secrets often
+# arrive with a trailing newline; if we drop that into a credential URL or HTTP
+# header the request becomes malformed and auth silently fails.
+_trim_token() {
+    local t="$1"
+    t="${t#"${t%%[![:space:]]*}"}"
+    t="${t%"${t##*[![:space:]]}"}"
+    printf '%s' "$t"
+}
+
+# Configure git Basic auth for a host via http.<url>.extraHeader. This avoids
+# URL-encoding pitfalls in credential.helper=store: PATs with `@`, `:`, `/`,
+# `=`, `+`, etc. don't need any escaping when sent as an HTTP header.
+_set_basic_auth_header() {
+    local url_prefix="$1" user="$2" pass="$3"
+    local b64
+    b64=$(printf '%s:%s' "$user" "$pass" | base64 | tr -d '\n')
+    git config --global "http.${url_prefix}.extraHeader" "Authorization: Basic ${b64}"
+}
+
 configure_credentials() {
     : > "${GIT_CRED_FILE}"
 
     case "${PLATFORM}" in
         github)
-            if [ -n "${GITHUB_TOKEN:-}" ]; then
-                printf 'https://x-access-token:%s@github.com\n' "${GITHUB_TOKEN}" >> "${GIT_CRED_FILE}"
-                export GH_TOKEN="${GITHUB_TOKEN}"
+            if [ -z "${GITHUB_TOKEN:-}" ]; then
+                # Fail loudly instead of cloning anonymously. An anonymous clone of a
+                # private repo makes GitHub answer "Repository not found" (it masks 403
+                # as 404), which is indistinguishable from a genuinely wrong URL. Mirror
+                # the azuredevops fail-fast below so the user gets an actionable error.
+                log "FATAL: GITHUB-TOKEN is required when platform=github."
+                exit 1
             fi
+            local gh_token
+            gh_token=$(_trim_token "${GITHUB_TOKEN}")
+            if [ -z "${gh_token}" ]; then
+                log "FATAL: GITHUB-TOKEN is empty after trimming whitespace."
+                exit 1
+            fi
+            printf 'https://x-access-token:%s@github.com\n' "${gh_token}" >> "${GIT_CRED_FILE}"
+            export GH_TOKEN="${gh_token}"
             ;;
         azuredevops)
             if [ -z "${AZURE_DEVOPS_TOKEN:-}" ]; then
                 log "FATAL: AZURE_DEVOPS_TOKEN is required when platform=azuredevops."
                 exit 1
             fi
+            local ado_token
+            ado_token=$(_trim_token "${AZURE_DEVOPS_TOKEN}")
+            if [ -z "${ado_token}" ]; then
+                log "FATAL: AZURE_DEVOPS_TOKEN is empty after trimming whitespace."
+                exit 1
+            fi
             REPOSITORY_URL=$(printf '%s' "${REPOSITORY_URL}" | sed -E 's|^https://[^@/]+@|https://|')
-            printf 'https://pat:%s@dev.azure.com\n' "${AZURE_DEVOPS_TOKEN}" >> "${GIT_CRED_FILE}"
 
+            # Configure http.extraHeader (the Azure DevOps-recommended Basic
+            # auth approach) for both the modern dev.azure.com host and the
+            # legacy {org}.visualstudio.com host. Username is empty per ADO
+            # convention (token alone authenticates).
+            _set_basic_auth_header "https://dev.azure.com/" "" "${ado_token}"
             if [[ "${REPOSITORY_URL}" =~ ^https://([^./]+)\.visualstudio\.com ]]; then
-                printf 'https://pat:%s@%s.visualstudio.com\n' "${AZURE_DEVOPS_TOKEN}" "${BASH_REMATCH[1]}" >> "${GIT_CRED_FILE}"
+                _set_basic_auth_header \
+                    "https://${BASH_REMATCH[1]}.visualstudio.com/" "" "${ado_token}"
             fi
             ;;
         *)

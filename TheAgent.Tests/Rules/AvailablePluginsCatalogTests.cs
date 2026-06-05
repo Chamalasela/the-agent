@@ -3,18 +3,31 @@ using Xianix.Rules;
 namespace TheAgent.Tests.Rules;
 
 /// <summary>
-/// Unit tests for the per-platform breakdown of <see cref="CatalogPlugin.EnvsByPlatform"/>.
+/// Unit tests for <see cref="CatalogPlugin.RequiredEnvs"/> — the model-facing list of
+/// every env declared on at least one execution that uses a given plugin.
 ///
-/// The chat-driven <c>RunClaudeCodeOnRepository</c> tool relies on this breakdown to ship
-/// only the credentials a given dispatch actually needs — without it, a plugin reused
-/// across GitHub and Azure DevOps webhook rules would drag both <c>secrets.GITHUB-TOKEN</c>
-/// and <c>secrets.AZURE-DEVOPS-TOKEN</c> into a single-platform run and fail at the
-/// secret-resolution step.
+/// The chat tool no longer uses any per-plugin env breakdown to forward credentials —
+/// envs are sourced rule-wide via <see cref="RulesEnvCatalog"/> instead — but
+/// <c>RequiredEnvs</c> is still surfaced to the LLM by <c>ListAvailablePlugins</c> so the
+/// model can ask the user about missing vault entries before triggering a run.
 /// </summary>
 public class AvailablePluginsCatalogTests
 {
     private static WebhookRuleSet RuleSetWith(params WebhookExecution[] executions) =>
         new() { WebhookName = "Default", Executions = executions.ToList() };
+
+    private static WebhookRuleSet RuleSetWithCommon(
+        IEnumerable<EnvEntry> commonEnvs,
+        params WebhookExecution[] executions) =>
+        new()
+        {
+            WebhookName = "Default",
+            WithEnvs    = commonEnvs.ToList(),
+            Executions  = executions.ToList(),
+        };
+
+    private static EnvEntry Env(string name, string value, bool mandatory = false) =>
+        new() { Name = name, Value = value, Mandatory = mandatory };
 
     private static WebhookExecution Execution(
         string platform,
@@ -34,7 +47,7 @@ public class AvailablePluginsCatalogTests
         };
 
     [Fact]
-    public void BuildCatalog_GroupsEnvsByPlatform_SoOnePluginCanBeReusedAcrossPlatforms()
+    public void BuildCatalog_RequiredEnvs_UnionEveryEnvAcrossExecutionsThatUseThePlugin()
     {
         var rules = new[]
         {
@@ -43,59 +56,16 @@ public class AvailablePluginsCatalogTests
                 Execution("azuredevops", "shared", ("AZURE-DEVOPS-TOKEN","secrets.AZURE-DEVOPS-TOKEN",true))),
         };
 
-        var catalog = AvailablePluginsCatalog.BuildCatalog(rules);
+        var plugin = Assert.Single(AvailablePluginsCatalog.BuildCatalog(rules));
 
-        var plugin = Assert.Single(catalog);
         Assert.Equal("shared", plugin.PluginName);
-
-        // Per-platform view — the chat tool consumes this for dispatch.
-        Assert.Equal(2, plugin.EnvsByPlatform.Count);
-        Assert.Contains("GITHUB-TOKEN",
-            plugin.EnvsByPlatform["github"].Select(e => e.Name));
-        Assert.DoesNotContain("AZURE-DEVOPS-TOKEN",
-            plugin.EnvsByPlatform["github"].Select(e => e.Name));
-        Assert.Contains("AZURE-DEVOPS-TOKEN",
-            plugin.EnvsByPlatform["azuredevops"].Select(e => e.Name));
-        Assert.DoesNotContain("GITHUB-TOKEN",
-            plugin.EnvsByPlatform["azuredevops"].Select(e => e.Name));
-
-        // Model-facing union still lists every env the plugin could ever ask for.
         Assert.Equal(
             new[] { "AZURE-DEVOPS-TOKEN", "GITHUB-TOKEN" },
             plugin.RequiredEnvs.Select(e => e.Name).OrderBy(n => n).ToArray());
     }
 
     [Fact]
-    public void BuildCatalog_NormalisesPlatformKey_ToLowercase()
-    {
-        var rules = new[]
-        {
-            RuleSetWith(Execution("GitHub", "p", ("GITHUB-TOKEN", "secrets.GITHUB-TOKEN", true))),
-        };
-
-        var plugin = Assert.Single(AvailablePluginsCatalog.BuildCatalog(rules));
-
-        Assert.True(plugin.EnvsByPlatform.ContainsKey("github"));
-        Assert.False(plugin.EnvsByPlatform.ContainsKey("GitHub"));
-    }
-
-    [Fact]
-    public void BuildCatalog_ExecutionWithoutPlatform_KeyedUnderEmptyString()
-    {
-        var rules = new[]
-        {
-            RuleSetWith(Execution(platform: "", "p", ("CUSTOM-ENV", "value", false))),
-        };
-
-        var plugin = Assert.Single(AvailablePluginsCatalog.BuildCatalog(rules));
-
-        Assert.True(plugin.EnvsByPlatform.ContainsKey(string.Empty));
-        Assert.Contains("CUSTOM-ENV",
-            plugin.EnvsByPlatform[string.Empty].Select(e => e.Name));
-    }
-
-    [Fact]
-    public void BuildCatalog_TwoExecutionsSamePlatform_DedupesByEnvNameFirstWins()
+    public void BuildCatalog_RequiredEnvs_DedupesByEnvNameFirstWins()
     {
         var rules = new[]
         {
@@ -105,11 +75,80 @@ public class AvailablePluginsCatalogTests
         };
 
         var plugin = Assert.Single(AvailablePluginsCatalog.BuildCatalog(rules));
-        var envs   = plugin.EnvsByPlatform["github"];
 
-        var entry = Assert.Single(envs);
+        var entry = Assert.Single(plugin.RequiredEnvs);
         Assert.Equal("GITHUB-TOKEN", entry.Name);
-        Assert.Equal("secrets.GITHUB-TOKEN-A", entry.Value);
         Assert.True(entry.Mandatory);
+    }
+
+    /// <summary>
+    /// A rule-set-wide common env applies to every execution in that rule set, so every
+    /// plugin invoked from any of those executions inherits it in its <c>RequiredEnvs</c>.
+    /// This is what powers the "declare GITHUB-TOKEN once at the top of the rule set"
+    /// pattern without losing visibility in the chat catalog.
+    /// </summary>
+    [Fact]
+    public void BuildCatalog_RequiredEnvs_IncludesRuleSetCommonEnvsForEveryPluginInRuleSet()
+    {
+        var rules = new[]
+        {
+            RuleSetWithCommon(
+                [ Env("GITHUB-TOKEN", "secrets.GITHUB-TOKEN", mandatory: true) ],
+                Execution("github", "pr-reviewer"),
+                Execution("github", "req-analyst")),
+        };
+
+        var catalog = AvailablePluginsCatalog.BuildCatalog(rules);
+
+        Assert.Equal(2, catalog.Count);
+        foreach (var plugin in catalog)
+        {
+            var entry = Assert.Single(plugin.RequiredEnvs);
+            Assert.Equal("GITHUB-TOKEN", entry.Name);
+            Assert.True(entry.Mandatory);
+        }
+    }
+
+    /// <summary>
+    /// When the rule-set common and the execution both declare an env with the same name,
+    /// the per-plugin <c>RequiredEnvs</c> dedup is first-wins — the common entry is added
+    /// before the execution loop reaches its own with-envs, so the common version stays
+    /// (matches the dedup order in <c>CatalogPluginBuilder.AddUsage</c>).
+    /// </summary>
+    [Fact]
+    public void BuildCatalog_RequiredEnvs_RuleSetCommonWinsOverDuplicateExecutionEnv()
+    {
+        var rules = new[]
+        {
+            RuleSetWithCommon(
+                [ Env("GITHUB-TOKEN", "secrets.GITHUB-TOKEN-COMMON", mandatory: true) ],
+                Execution("github", "p", ("GITHUB-TOKEN", "secrets.GITHUB-TOKEN-EXEC", false))),
+        };
+
+        var plugin = Assert.Single(AvailablePluginsCatalog.BuildCatalog(rules));
+
+        var entry = Assert.Single(plugin.RequiredEnvs);
+        Assert.Equal("GITHUB-TOKEN", entry.Name);
+        Assert.True(entry.Mandatory);
+    }
+
+    /// <summary>
+    /// Empty-name common entries are dropped from <c>RequiredEnvs</c> just like
+    /// execution-level entries — defensive against typo'd rules.json.
+    /// </summary>
+    [Fact]
+    public void BuildCatalog_RequiredEnvs_DropsBlankNameRuleSetCommonEntries()
+    {
+        var rules = new[]
+        {
+            RuleSetWithCommon(
+                [ Env("", "secrets.NOPE"), Env("GITHUB-TOKEN", "secrets.GITHUB-TOKEN", true) ],
+                Execution("github", "p")),
+        };
+
+        var plugin = Assert.Single(AvailablePluginsCatalog.BuildCatalog(rules));
+
+        var entry = Assert.Single(plugin.RequiredEnvs);
+        Assert.Equal("GITHUB-TOKEN", entry.Name);
     }
 }

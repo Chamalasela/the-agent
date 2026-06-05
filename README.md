@@ -106,9 +106,27 @@ From the repo root:
 # Development (loads .env)
 dotnet run --project TheAgent/TheAgent.csproj
 
-# Production (loads .env.prod)
-APP_ENV=prod dotnet run --project TheAgent/TheAgent.csproj
+# Production (loads .env.production)
+APP_ENV=production dotnet run --project TheAgent/TheAgent.csproj
 ```
+
+To use a different `.env` file, set `APP_ENV` to any name — the agent loads `.env.<APP_ENV>` from the `TheAgent/` directory:
+
+```bash
+# Loads TheAgent/.env.local
+APP_ENV=local dotnet run --project TheAgent/TheAgent.csproj
+
+# Loads TheAgent/.env.alice (useful for per-developer overrides)
+APP_ENV=alice dotnet run --project TheAgent/TheAgent.csproj
+```
+
+Create the file by copying the example and filling in your values:
+
+```bash
+cp TheAgent/.env.example TheAgent/.env.local
+```
+
+> The file must live in `TheAgent/` — `EnvConfig.Load` resolves the name relative to the working directory via `DotNetEnv`'s `TraversePath`. Arbitrary file paths are not supported; use `APP_ENV` to switch between files in that folder.
 
 ## Tests
 

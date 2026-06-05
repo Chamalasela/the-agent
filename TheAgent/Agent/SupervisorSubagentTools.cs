@@ -276,20 +276,43 @@ public sealed class SupervisorSubagentTools(UserMessageContext context, ILogger<
         if (resolution is ResolutionResult.Missing missing)
             return BuildMissingInputsError(missing);
 
-        var effectiveInputs = ((ResolutionResult.Success)resolution).Inputs;
+        // Force `platform` to the URL-inferred value so the executor's _common.sh picks the
+        // correct credential helper. PluginInputResolver only injects `platform` as a side
+        // effect of a winning plugin usage example carrying it as a Constant — so a no-plugin
+        // chat (or a plugin whose rules don't declare a platform) would otherwise leave
+        // XIANIX_INPUTS.platform unset, causing _common.sh to fall back to its "github"
+        // default and run the github credential path against (potentially) an ADO URL. The
+        // URL is the authoritative source of truth here, so we override even the plugin
+        // constant: a plugin tagged `platform=github` against an ADO URL would auth-fail in
+        // exactly the same way.
+        var effectiveInputs = new Dictionary<string, string>(
+            ((ResolutionResult.Success)resolution).Inputs,
+            StringComparer.OrdinalIgnoreCase)
+        {
+            [AvailablePluginsCatalog.PlatformInput] = platform,
+        };
 
-        // Pick only the with-envs the chosen plugins declared on executions targeting THIS
-        // platform (plus any platform-agnostic ones). The plugin catalog deliberately keeps
-        // a per-platform breakdown so a plugin reused across GitHub and Azure DevOps rules
-        // doesn't drag both `secrets.GITHUB-TOKEN` and `secrets.AZURE-DEVOPS-TOKEN` into a
-        // single-platform run — that would force the tenant to have a credential they don't
-        // need and fail at the secret-resolution step. Then we merge in the platform-
-        // required credential envs (GITHUB-TOKEN / AZURE-DEVOPS-TOKEN) so the executor can
-        // clone the repo on its own even if the user picked no plugin or a plugin that
-        // happens not to declare the matching platform PAT — without these the lazy-clone
-        // path would fail at git auth time. Plugin-declared entries win on ties.
-        var withEnvs = resolvedPlugins
-            .SelectMany(p => SelectEnvsForPlatform(p, platform))
+        // Chat-driven runs have no matched WebhookExecution to source `with-envs` from, so
+        // we treat rules.json as the manifest of "every credential this agent ever needs"
+        // and ship the platform-relevant subset every dispatch — irrespective of which
+        // (if any) plugin the model picked. Without this, a no-plugin chat (or a chat with
+        // a plugin that doesn't happen to be referenced by the rule that declares the
+        // needed secret) would only get the platform PAT and would fail the moment Claude
+        // Code reached for any other tenant credential.
+        //
+        // `RulesEnvCatalog.LoadEnvsForPlatformAsync` returns both the rule-set-wide
+        // common envs (`WebhookRuleSet.WithEnvs` — applied to every execution by design,
+        // so always included regardless of platform) AND the per-execution envs that
+        // match the requested platform (or are platform-agnostic). That keeps the chat
+        // path symmetric with the webhook merge in WebhookRulesEvaluator: anything
+        // declared as a rule-set common shows up here too.
+        //
+        // The platform filter is preserved so a single-platform run never inherits the
+        // *other* platform's mandatory PATs and trips the missing-secret fail-fast in
+        // ContainerActivities.InjectExecutionEnvVarsAsync. The platform-required
+        // credential envs are still merged in last so the executor can clone the repo
+        // even when no rule declares the matching PAT. Rules.json entries win on ties.
+        var withEnvs = (await RulesEnvCatalog.LoadEnvsForPlatformAsync(platform))
             .Concat(RepositoryPlatform.RequiredCredentialEnvs(platform))
             .GroupBy(e => e.Name, StringComparer.Ordinal)
             .Select(g => g.First())
@@ -333,28 +356,53 @@ public sealed class SupervisorSubagentTools(UserMessageContext context, ILogger<
         return $"{clonePrefix}Started Claude Code on `{repoName}`{pluginSuffix}. Output will be streamed in subsequent messages — do not repeat it back to the user.";
     }
 
-    /// <summary>
-    /// Picks the with-envs from a catalog plugin that are relevant to the dispatch's
-    /// platform: entries declared on executions targeting <paramref name="platform"/> plus
-    /// entries from platform-agnostic executions (those with an empty Platform binding,
-    /// stored under the empty-string key). Lookup is case-insensitive on platform.
-    /// Returns an empty sequence when the plugin has no executions on this platform and
-    /// no platform-agnostic executions — the caller still merges in the
-    /// <see cref="RepositoryPlatform.RequiredCredentialEnvs(string)"/> baseline so the
-    /// clone can authenticate regardless.
-    /// </summary>
-    internal static IEnumerable<EnvEntry> SelectEnvsForPlatform(CatalogPlugin plugin, string platform)
+    [Description(
+        "Permanently remove a repository from this tenant's workspace. " +
+        "Use this when the user asks to delete, remove, or offboard a repository, " +
+        "or when a previous OnboardRepository call failed and the user wants to clean up " +
+        "the partially-cloned volume before trying again. " +
+        "This deletes the entire Docker volume that stores the bare clone, all cached " +
+        "context files, and all Claude Code session state for that repository — " +
+        "the data cannot be recovered. " +
+        "Always confirm with the user before calling this tool. " +
+        "Returns immediately with a success or error message; no follow-up workflow messages are sent.")]
+    public async Task<string> OffboardRepository(
+        [Description("The repository URL to remove. Must be exactly as shown in ListTenantRepositories.")] string repositoryUrl)
     {
-        var key = (platform ?? string.Empty).Trim().ToLowerInvariant();
-        if (plugin.EnvsByPlatform.TryGetValue(key, out var matched))
+        if (string.IsNullOrWhiteSpace(repositoryUrl))
+            return "ERROR: repositoryUrl is required. Call ListTenantRepositories to see which repositories are onboarded.";
+
+        var tenantId = context.Message.TenantId;
+
+        var existing = await TenantVolumeReader.ListAsync(tenantId);
+        if (!existing.Any(r => string.Equals(r.Url, repositoryUrl, StringComparison.Ordinal)))
         {
-            foreach (var e in matched) yield return e;
+            return $"Repository `{repositoryUrl}` is not onboarded for this tenant — nothing to remove.";
         }
-        if (key.Length > 0
-            && plugin.EnvsByPlatform.TryGetValue(string.Empty, out var agnostic))
+
+        var repoName = RepositoryNaming.DeriveName(repositoryUrl);
+
+        _logger.LogInformation(
+            "Offboarding repository: tenant={TenantId} repo={RepoName} url={RepositoryUrl}",
+            tenantId, repoName, repositoryUrl);
+
+        var result = await TenantVolumeReader.DeleteAsync(tenantId, repositoryUrl);
+
+        return result switch
         {
-            foreach (var e in agnostic) yield return e;
-        }
+            DeleteVolumeResult.Deleted =>
+                $"Repository `{repoName}` has been removed from this tenant's workspace. " +
+                "The clone, cached context, and all session state for that repository have been deleted.",
+
+            DeleteVolumeResult.NotFound =>
+                $"Repository `{repoName}` was already absent — no volume to remove.",
+
+            DeleteVolumeResult.InUse =>
+                $"ERROR: Repository `{repoName}` is currently being used by a running execution and cannot be deleted right now. " +
+                "Wait for any active runs to finish and try again.",
+
+            _ => "ERROR: Unexpected result from volume deletion. Please try again.",
+        };
     }
 
     /// <summary>

@@ -21,4 +21,12 @@ public sealed class ContainerExecutionResult
     public long?   CacheCreationTokens  { get; set; }
     public string? SessionId            { get; set; }
     public double? DurationSeconds      { get; set; }
+
+    /// <summary>
+    /// Distinct Claude model names the run actually used (e.g. <c>claude-sonnet-4-5</c>),
+    /// parsed from the executor's <c>models</c> field. Null when the executor didn't report
+    /// any. Drives the per-model breakdown in <see cref="Xianix.Workflows.ExecutionMetrics"/>
+    /// so model-tiering changes can be charted by the model that did the work.
+    /// </summary>
+    public IReadOnlyList<string>? Models { get; set; }
 }

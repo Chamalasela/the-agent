@@ -85,14 +85,8 @@ public class OnboardRepositoryWorkflow
             }
             else
             {
-                // No JSON envelope in prepare mode (execute_plugin.py never runs), so the
-                // most useful failure detail is in stderr — typically a git clone error
-                // (auth failure / network) or the platform-credential fail-fast from
-                // _common.sh.
-                var errorDetail = string.IsNullOrWhiteSpace(result.StdErr)
-                    ? $"(no error output; container exit code {result.ExitCode})"
-                    : result.StdErr;
-                summary = $"Onboarding failed for `{req.RepositoryName}` (exit={result.ExitCode}):\n\n{Truncate(errorDetail, 1500)}";
+                summary = BuildFailureSummary(
+                    req.RepositoryName, req.Platform, result.ExitCode, result.StdErr);
             }
 
             await NotifyAsync(req, summary);
@@ -117,6 +111,90 @@ public class OnboardRepositoryWorkflow
         string.IsNullOrEmpty(text) || text.Length <= max
             ? text
             : text[..max] + $"…(+{text.Length - max} chars)";
+
+    /// <summary>
+    /// Turns a failed prepare-phase run into a user-facing message. In prepare mode there is
+    /// no JSON envelope (execute_plugin.py never runs), so the only signal is the container's
+    /// exit code plus stderr — typically a git clone error or the platform-credential
+    /// fail-fast from <c>_common.sh</c>. We translate the most common git failures into the
+    /// concrete decision the user has to make, then still append the raw output for anyone
+    /// who needs it. <c>internal</c> + <c>static</c> so it can be unit-tested without a
+    /// workflow host.
+    /// </summary>
+    internal static string BuildFailureSummary(
+        string repositoryName, string platform, int exitCode, string? stdErr)
+    {
+        var rawDetail = string.IsNullOrWhiteSpace(stdErr)
+            ? $"(no error output; container exit code {exitCode})"
+            : stdErr;
+
+        var guidance = DiagnoseFailure(stdErr, platform);
+
+        var header = $"Onboarding failed for `{repositoryName}` (exit={exitCode}).";
+        return guidance is null
+            ? $"{header}\n\n{Truncate(rawDetail, 1500)}"
+            : $"{header}\n\n{guidance}\n\n---\nRaw output:\n\n{Truncate(rawDetail!, 1500)}";
+    }
+
+    /// <summary>
+    /// Best-effort classification of a git clone failure into an actionable message, or
+    /// <c>null</c> when nothing matches (caller falls back to the raw stderr). Matching is
+    /// case-insensitive and intentionally pattern-based: git/GitHub wording is stable enough
+    /// for these well-known cases, and an unmatched failure still surfaces the raw output.
+    /// </summary>
+    private static string? DiagnoseFailure(string? stdErr, string platform)
+    {
+        if (string.IsNullOrWhiteSpace(stdErr))
+            return null;
+
+        var s = stdErr.ToLowerInvariant();
+        bool Has(string needle) => s.Contains(needle, StringComparison.Ordinal);
+
+        // Our own fail-fast from _common.sh when the tenant has no PAT in the vault.
+        if (Has("github-token is required") || Has("github-token is empty"))
+        {
+            return "No valid `GITHUB-TOKEN` is configured for this tenant. " +
+                   "Add it to the Xians Secret Vault, then retry onboarding.";
+        }
+
+        if (Has("azure_devops_token is required") || Has("azure-devops-token is required")
+            || Has("azure_devops_token is empty"))
+        {
+            return "No valid `AZURE-DEVOPS-TOKEN` is configured for this tenant. " +
+                   "Add it to the Xians Secret Vault, then retry onboarding.";
+        }
+
+        // GitHub deliberately masks 403 (private, no access) as 404 (not found), so this
+        // single message has to cover both a wrong URL and a credential/access problem.
+        if (Has("repository not found") || Has("not found"))
+        {
+            var credName = platform == RepositoryPlatform.AzureDevOps
+                ? "AZURE-DEVOPS-TOKEN"
+                : "GITHUB-TOKEN";
+            return "The git host returned **\"repository not found\"**, which means one of two things:\n" +
+                   "1. The repository owner/name is wrong — double-check the URL.\n" +
+                   $"2. The repository is **private** and this tenant's `{credName}` is missing, expired, or lacks access to it.\n\n" +
+                   "Hosts report both cases identically to avoid leaking private repos, so verify the URL first, then the token's access/scope.";
+        }
+
+        if (Has("authentication failed") || Has("invalid username or password")
+            || Has("could not read username") || Has("permission denied")
+            || Has("access denied") || Has(" 403"))
+        {
+            return "Authentication to the git host failed. This tenant's credential is likely missing, " +
+                   "expired, or lacks access to the repository. Refresh the token in the Xians Secret Vault and retry.";
+        }
+
+        if (Has("could not resolve host") || Has("connection timed out")
+            || Has("connection refused") || Has("network is unreachable")
+            || Has("failed to connect"))
+        {
+            return "Could not reach the git host (a network/DNS problem). " +
+                   "Check connectivity from the executor and retry.";
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Constructs the <see cref="ContainerExecutionInput"/> for an onboarding run.

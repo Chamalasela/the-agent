@@ -8,6 +8,21 @@ public sealed class WebhookRuleSet
     [JsonPropertyName("webhook")]
     public string WebhookName { get; init; } = "";
 
+    /// <summary>
+    /// Rule-set-wide common environment variables that apply to <em>every</em> execution
+    /// in this rule set. Use these for credentials or settings every execution shares
+    /// (e.g. a <c>GITHUB-TOKEN</c> consumed by every GitHub-driven execution) so the same
+    /// declaration doesn't have to be repeated on each <see cref="WebhookExecution.WithEnvs"/>.
+    /// Each execution's own <see cref="WebhookExecution.WithEnvs"/> takes precedence by env
+    /// name — if an execution declares an env with the same <see cref="EnvEntry.Name"/>,
+    /// the execution-level entry wins and the rule-set-level entry is dropped for that
+    /// execution. Every entry must use one of the same three explicit forms as the
+    /// execution-level list (<c>host.*</c>, <c>secrets.*</c>, or <c>constant: true</c>);
+    /// bare names are rejected at container-start time.
+    /// </summary>
+    [JsonPropertyName("with-envs")]
+    public List<EnvEntry> WithEnvs { get; init; } = [];
+
     [JsonPropertyName("executions")]
     public List<WebhookExecution> Executions { get; init; } = [];
 }
@@ -69,6 +84,59 @@ public sealed class WebhookExecution
     /// </summary>
     [JsonPropertyName("with-envs")]
     public List<EnvEntry> WithEnvs { get; init; } = [];
+
+    /// <summary>
+    /// Optional Claude model the executor should run this block on (e.g.
+    /// <c>claude-haiku-4-5</c> for mechanical tasks, <c>claude-sonnet-4-5</c> for deep
+    /// reasoning). Empty means "let the executor use its configured default". Surfaced to the
+    /// container as the <c>XIANIX-MODEL</c> env var and passed to the Claude Code SDK as the
+    /// primary model — the key cost lever for model tiering.
+    /// </summary>
+    [JsonPropertyName("model")]
+    public string Model { get; init; } = "";
+
+    /// <summary>
+    /// Optional hard cap on the number of agent turns for this block. Null means "no cap"
+    /// (only the container wall-clock timeout applies). A token backstop against runaway
+    /// loops; surfaced to the container as <c>XIANIX-MAX-TURNS</c>.
+    /// </summary>
+    [JsonPropertyName("max-turns")]
+    public int? MaxTurns { get; init; }
+
+    /// <summary>
+    /// Optional allow-list of tool names the agent may use for this block. When non-empty,
+    /// the agent can use only these tools. Surfaced to the container as
+    /// <c>XIANIX-ALLOWED-TOOLS</c> (comma-separated).
+    /// </summary>
+    [JsonPropertyName("allowed-tools")]
+    public List<string> AllowedTools { get; init; } = [];
+
+    /// <summary>
+    /// Optional deny-list of tool names the agent must not use for this block (e.g.
+    /// <c>WebSearch</c>, <c>WebFetch</c> when a task doesn't need them). Surfaced to the
+    /// container as <c>XIANIX-DISALLOWED-TOOLS</c> (comma-separated).
+    /// </summary>
+    [JsonPropertyName("disallowed-tools")]
+    public List<string> DisallowedTools { get; init; } = [];
+
+    /// <summary>
+    /// Optional hard spend cap (USD) for this block. The executor passes it to the Claude Code
+    /// SDK as <c>max_budget_usd</c>, which aborts the run once the cap is hit. Surfaced to the
+    /// container as <c>XIANIX-MAX-BUDGET-USD</c> and also charted via metrics (configured budget
+    /// + over-budget flag). Null means no cap.
+    /// </summary>
+    [JsonPropertyName("max-budget-usd")]
+    public double? MaxBudgetUsd { get; init; }
+
+    /// <summary>
+    /// When true, back-to-back runs against the same conversation (repo + PR/issue) resume the
+    /// prior Claude Code session instead of rebuilding context — a cost lever for bursty
+    /// <c>synchronize</c>/re-review flows. Surfaced to the container as
+    /// <c>XIANIX-RESUME-SESSIONS</c>; the executor treats it as best-effort (a failed resume
+    /// falls back to a fresh run). Defaults to <c>false</c>.
+    /// </summary>
+    [JsonPropertyName("resume-sessions")]
+    public bool ResumeSessions { get; init; }
 
     /// <summary>
     /// Prompt template to execute after all plugins are installed.

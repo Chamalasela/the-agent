@@ -98,4 +98,63 @@ public class OnboardRepositoryWorkflowTests
         Assert.Contains("\"name\":\"AZURE-DEVOPS-TOKEN\"",         input.WithEnvsJson);
         Assert.Contains("\"value\":\"secrets.AZURE-DEVOPS-TOKEN\"", input.WithEnvsJson);
     }
+
+    [Fact]
+    public void BuildFailureSummary_RepositoryNotFound_ExplainsBothCausesAndKeepsRawOutput()
+    {
+        const string stderr = "remote: Repository not found.\n" +
+                              "fatal: repository 'https://github.com/Xians/XiansAi.Server/' not found";
+
+        var summary = OnboardRepositoryWorkflow.BuildFailureSummary(
+            "Xians/XiansAi.Server", RepositoryPlatform.GitHub, 128, stderr);
+
+        // Both the wrong-URL and the private/missing-token explanations must appear so the
+        // user knows which two things to check, plus the matching credential name.
+        Assert.Contains("repository not found", summary, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("owner/name is wrong", summary);
+        Assert.Contains("private", summary);
+        Assert.Contains("GITHUB-TOKEN", summary);
+        // Raw git output is still preserved for debugging.
+        Assert.Contains("fatal: repository", summary);
+        Assert.Contains("(exit=128)", summary);
+    }
+
+    [Fact]
+    public void BuildFailureSummary_MissingGitHubToken_PointsAtSecretVault()
+    {
+        // Matches the fail-fast emitted by Executor/_common.sh.
+        const string stderr = "FATAL: GITHUB-TOKEN is required when platform=github.";
+
+        var summary = OnboardRepositoryWorkflow.BuildFailureSummary(
+            "acme/app", RepositoryPlatform.GitHub, 1, stderr);
+
+        Assert.Contains("GITHUB-TOKEN", summary);
+        Assert.Contains("Secret Vault", summary);
+    }
+
+    [Fact]
+    public void BuildFailureSummary_AzureDevOps_NotFound_UsesAzureCredentialName()
+    {
+        const string stderr = "remote: TF401019: The Git repository does not exist or you do not have access. not found";
+
+        var summary = OnboardRepositoryWorkflow.BuildFailureSummary(
+            "org/r", RepositoryPlatform.AzureDevOps, 128, stderr);
+
+        Assert.Contains("AZURE-DEVOPS-TOKEN", summary);
+        Assert.DoesNotContain("GITHUB-TOKEN", summary);
+    }
+
+    [Fact]
+    public void BuildFailureSummary_UnrecognisedError_FallsBackToRawOutput()
+    {
+        const string stderr = "error: some totally novel git failure mode";
+
+        var summary = OnboardRepositoryWorkflow.BuildFailureSummary(
+            "acme/app", RepositoryPlatform.GitHub, 99, stderr);
+
+        // No guidance section, but the raw output and exit code are still surfaced.
+        Assert.Contains("some totally novel git failure mode", summary);
+        Assert.Contains("(exit=99)", summary);
+        Assert.DoesNotContain("Raw output:", summary);
+    }
 }

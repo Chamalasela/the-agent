@@ -8,9 +8,10 @@ The `xianix-executor` Docker image runs inside an isolated container per tenant 
 |------|---------|
 | `Dockerfile` | Image definition — Python 3.12, Node.js 20, git, gh CLI, Claude Code CLI + SDK |
 | `entrypoint.sh` | Thin dispatcher — picks `prepare_repo.sh` and/or `run_prompt.sh` based on `XIANIX-MODE` |
-| `prepare_repo.sh` | Configures git credentials and bare-clone-or-fetches the repo into `/workspace/repo`. In `prepare-and-execute` mode it also creates the per-execution worktree at `/workspace/exec-${EXECUTION-ID}`. |
-| `run_prompt.sh` | Installs Claude Code plugins, launches `execute_plugin.py`, then cleans up the worktree |
+| `prepare_repo.sh` | Configures git credentials, bare-clone-or-fetches the repo into `/workspace/repo`, and **always pulls the upstream default branch** (so `git diff origin/<default>` and the no-`git-ref` worktree path see the freshest tip on every run, for both webhook and chat-driven executions). In `prepare-and-execute` mode it also creates the per-execution worktree at `/workspace/exec-${EXECUTION-ID}`. |
+| `run_prompt.sh` | Installs Claude Code plugins, prepares cached repo context, launches `execute_plugin.py`, then cleans up the worktree |
 | `_common.sh` | Shared helpers sourced by both phase scripts (env aliasing, `log`, input parsing, `configure_credentials`) |
+| `generate_context.sh` | Builds a cached `CLAUDE.md` + `.xianix/repomap.txt` (symbol map) for the repo so the agent doesn't re-explore the codebase cold on every run. The facts (overview, stack, layout, symbols) are deterministic and token-free; optionally (`XIANIX-CONTEXT-LLM=1`) a budget-/turn-capped Haiku pass appends an "Architecture & conventions" narrative. Cached on the volume keyed by HEAD (so the LLM pass runs at most once per HEAD change); never overwrites a tenant-authored `CLAUDE.md`, and the LLM pass is skipped entirely when one exists. |
 | `execute_plugin.py` | Invokes Claude Code SDK against the worktree; writes JSON result to stdout |
 | `requirements.txt` | Python dependencies (pinned) |
 | `.dockerignore` | Build context exclusions |
@@ -50,6 +51,12 @@ docker run --rm \
 ### Persistent volume across runs
 
 The `/workspace/repo` mount holds a **bare git clone**. On first run the repo is cloned; subsequent runs do a fast `git fetch`. Each execution creates an isolated git worktree from the bare repo — multiple concurrent executions against the same volume are safe.
+
+Every run — webhook-triggered or chat-conversational — also re-pulls the upstream's **default branch** before any plugin or prompt action runs. This keeps `refs/heads/<default>` and the bare clone's `HEAD` in lock-step with the remote, so:
+
+- A plugin doing `git diff origin/<default>` always sees the latest base.
+- A no-`git-ref` worktree (`worktree add HEAD --detach`) always picks up the freshest default tip, even if a previous run left the bare clone on something else.
+- An upstream default-branch rename (e.g. `master` → `main`) self-heals on the next execution rather than breaking subsequent worktree creations.
 
 ```bash
 docker volume create xianix-test-vol
