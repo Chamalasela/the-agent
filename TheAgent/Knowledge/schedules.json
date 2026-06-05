@@ -1,28 +1,30 @@
 [
     {
-        "schedule": "github-pull-request-review-schedule",
-        "cron": "0 0 * * *",
+        "schedule": "github-dependency-optimizer-schedule",
+        "cron": "*/5 * * * *",
         "use-inputs": {
-            "pr-number": "194",
             "repository-url": "https://github.com/99x-Projects/qib.git",
             "repository-name": "99x-Projects/qib",
-            "pr-title": "Test",
-            "pr-head-branch": "3799e5e715d1b1eea645295ed4a238e7bae51314",
             "platform": "github"
         },
         "use-plugins": [
             {
-                "plugin-name": "pr-reviewer@xianix-plugins-official",
+                "plugin-name": "dependency-optimizer@xianix-plugins-official",
                 "marketplace": "xianix-team/plugins-official"
             }
         ],
         "with-envs": [
             {
                 "name": "GITHUB-TOKEN",
-                "value": "host.GITHUB-TOKEN",
+                "value": "secrets.GITHUB-TOKEN-QIB",
+                "mandatory": true
+            },
+            {
+                "name": "ANTROPIC-API-KEY",
+                "value": "secrets.ANTROPIC-API-KEY",
                 "mandatory": true
             }
         ],
-        "execute-prompt": "You are reviewing pull request #{{pr-number}} titled \"{{pr-title}}\" in the repository {{repository-name}} (branch: {{pr-head-branch}}).\n\nRun /code-review to perform the automated review. The `gh` CLI is authenticated and available if you need it directly."
+        "execute-prompt": "xianix-agent is assigned for dependency health optimization.Run \n\n /dependency-optimizer to auto-scan manifests, verify licenses, and automatically open a remediation Pull Request."
     }
 ]
