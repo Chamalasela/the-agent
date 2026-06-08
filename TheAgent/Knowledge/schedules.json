@@ -1,30 +1,3 @@
 [
-    {
-        "schedule": "github-dependency-optimizer-schedule",
-        "cron": "*/5 * * * *",
-        "use-inputs": {
-            "repository-url": "https://github.com/99x-Projects/qib.git",
-            "repository-name": "99x-Projects/qib",
-            "platform": "github"
-        },
-        "use-plugins": [
-            {
-                "plugin-name": "dependency-optimizer@xianix-plugins-official",
-                "marketplace": "xianix-team/plugins-official"
-            }
-        ],
-        "with-envs": [
-            {
-                "name": "GITHUB-TOKEN",
-                "value": "secrets.GITHUB-TOKEN-QIB",
-                "mandatory": true
-            },
-            {
-                "name": "ANTROPIC-API-KEY",
-                "value": "secrets.ANTROPIC-API-KEY",
-                "mandatory": true
-            }
-        ],
-        "execute-prompt": "xianix-agent is assigned for dependency health optimization.Run \n\n /dependency-optimizer to auto-scan manifests, verify licenses, and automatically open a remediation Pull Request."
-    }
+
 ]
