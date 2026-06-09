@@ -86,11 +86,8 @@ if [ -n "${CLAUDE_CODE_PLUGINS:-}" ] && [ "${CLAUDE_CODE_PLUGINS}" != "[]" ]; th
         if claude plugin install "${url}" --scope project >&2; then
             installed_info=$(claude plugin list --json 2>/dev/null \
                 | jq -r --arg id "${url}" '
-                    .[]
-                    | select(.id == $id)
-                    | "\(.version // "unknown")\t\(.installPath // "")"
-                  ' \
-                | head -n1)
+                    first(.[] | select(.id == $id) | "\(.version // "unknown")\t\(.installPath // "")")
+                  ' 2>/dev/null) || true
             if [ -n "${installed_info}" ]; then
                 installed_version="${installed_info%%$'\t'*}"
                 installed_path="${installed_info#*$'\t'}"

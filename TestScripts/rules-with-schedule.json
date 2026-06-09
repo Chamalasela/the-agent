@@ -1,0 +1,84 @@
+[
+    {
+        "webhook": "Default",
+        "with-envs": [
+            {
+                "name": "GITHUB-TOKEN",
+                "value": "secrets.GITHUB-TOKEN",
+                "mandatory": true
+            }
+        ],
+        "executions": [
+            {
+                "name": "github-pull-request-review",
+                "platform": "github",
+                "repository": {
+                    "url": "repository.clone_url",
+                    "ref": "pull_request.head.ref"
+                },
+                "match-any": [
+                    {
+                        "name": "github-pr-tag-applied",
+                        "rule": "action==labeled&&label.name=='ai-dlc/pr/pr-review'"
+                    },
+                    {
+                        "name": "github-pr-opened-with-tag",
+                        "rule": "action==opened&&pull_request.labels.*.name=='ai-dlc/pr/pr-review'"
+                    },
+                    {
+                        "name": "github-pr-synchronize-with-tag",
+                        "rule": "action==synchronize&&pull_request.labels.*.name=='ai-dlc/pr/pr-review'"
+                    }
+                ],
+                "use-inputs": [
+                    {
+                        "name": "pr-link",
+                        "value": "pull_request.url"
+                    }
+                ],
+                "use-plugins": [
+                    {
+                        "plugin-name": "pr-reviewer@xianix-plugins-official",
+                        "marketplace": "xianix-team/plugins-official"
+                    }
+                ],
+                "model": "claude-sonnet-4-5",
+                "max-budget-usd": 3.0,
+                "execute-prompt": "You are reviewing pull request {{pr-link}}. Run /pr-review to perform the automated review."
+            }
+        ]
+    },
+    {
+        "schedule": "Weekly-schedule",
+        "cron": "*/5 * * * *",
+        "with-envs": [
+            {
+                "name": "GITHUB-TOKEN",
+                "value": "secrets.AGENTRI-GITHUB-KEY",
+                "mandatory": true
+            },
+            {
+                "name": "ANTROPIC-API-KEY",
+                "value": "secrets.ANTROPIC-API-KEY",
+                "mandatory": true
+            }
+        ],
+        "executions": [
+            {
+                "name": "github-dependency-optimizer",
+                "platform": "github",
+                "repository": {
+                    "url": "https://github.com/99x-Projects/qib.git",
+                    "ref": "main"
+                },
+                "use-plugins": [
+                    {
+                        "plugin-name": "dependency-optimizer@xianix-plugins-official",
+                        "marketplace": "xianix-team/plugins-official"
+                    }
+                ],
+                "execute-prompt": "xianix-agent is assigned for dependency health optimization.Run \n\n /dependency-optimizer to auto-scan manifests, verify licenses, and automatically open a remediation Pull Request."
+            }
+        ]
+    }
+]
