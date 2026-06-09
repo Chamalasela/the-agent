@@ -8,11 +8,16 @@ namespace Xianix.Orchestrator;
 public sealed class EventOrchestrator : IEventOrchestrator
 {
     private readonly IWebhookRulesEvaluator _rulesEvaluator;
+    private readonly IWebhookDeduplicationGuard _deduplicationGuard;
     private readonly ILogger<EventOrchestrator> _logger;
 
-    public EventOrchestrator(IWebhookRulesEvaluator rulesEvaluator, ILogger<EventOrchestrator> logger)
+    public EventOrchestrator(
+        IWebhookRulesEvaluator rulesEvaluator,
+        IWebhookDeduplicationGuard deduplicationGuard,
+        ILogger<EventOrchestrator> logger)
     {
         _rulesEvaluator = rulesEvaluator ?? throw new ArgumentNullException(nameof(rulesEvaluator));
+        _deduplicationGuard = deduplicationGuard ?? throw new ArgumentNullException(nameof(deduplicationGuard));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -81,10 +86,20 @@ public sealed class EventOrchestrator : IEventOrchestrator
             });
         }
 
+        var deduplicated = matches.Where(m => !_deduplicationGuard.IsDuplicate(m)).ToList();
+
+        var suppressed = matches.Count - deduplicated.Count;
+        if (suppressed > 0)
+        {
+            _logger.LogInformation(
+                "Tenant {TenantId}: webhook '{WebhookName}' — {Suppressed} duplicate execution(s) suppressed by deduplication guard.",
+                tenantId, webhookName, suppressed);
+        }
+
         _logger.LogInformation(
             "Tenant {TenantId}: webhook '{WebhookName}' — {MatchCount} execution(s) will be scheduled.",
-            tenantId, webhookName, matches.Count);
+            tenantId, webhookName, deduplicated.Count);
 
-        return new OrchestrateWebhookResult { Matches = matches };
+        return new OrchestrateWebhookResult { Matches = deduplicated };
     }
 }

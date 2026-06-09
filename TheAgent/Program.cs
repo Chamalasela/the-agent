@@ -127,6 +127,7 @@ static ServiceProvider ConfigureServices()
     });
 
     services.AddSingleton<IWebhookRulesEvaluator, WebhookRulesEvaluator>();
+    services.AddSingleton<IWebhookDeduplicationGuard, WebhookDeduplicationGuard>();
     services.AddSingleton<IEventOrchestrator, EventOrchestrator>();
     services.AddSingleton<XianixAgent>();
 
