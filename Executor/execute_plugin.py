@@ -144,22 +144,107 @@ def persist_session(key: str, session_id: str | None) -> None:
         log(f"WARNING: could not persist session id for '{key}': {exc}")
 
 
-async def collect_messages(prompt: str, options: ClaudeAgentOptions) -> dict:
-    """Runs one query and collects the assistant output / tool uses / usage into a dict."""
-    text_blocks: list[str] = []
-    tool_uses: list[dict] = []
-    models_seen: set[str] = set()
-    result_message: ResultMessage | None = None
-    turn_count = 0
+# ── Usage accumulation ─────────────────────────────────────────────────────────
+# The SDK only reports an authoritative cost on the final ResultMessage. When a run is
+# aborted mid-stream — most notably when `max_budget_usd` is hit, where the SDK raises a
+# transport-level error *before* yielding any ResultMessage — that message never arrives,
+# so cost/token metrics would be lost entirely. To keep an aborted run's metrics intact we
+# also accumulate the per-turn `usage` each AssistantMessage carries: every turn is one
+# billed API call, so summing per-call usage gives the true total token spend, and per-model
+# splits let the consumer price the run accurately even without the ResultMessage.
+
+# CLI usage keys (per the Anthropic API response shape).
+_SDK_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+# Map CLI usage keys → the executor envelope's token field names (matching build_output).
+_ENVELOPE_USAGE_KEYS = {
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "cache_read_input_tokens": "cache_read_tokens",
+    "cache_creation_input_tokens": "cache_creation_tokens",
+}
+
+
+def _add_usage(totals: dict[str, int], usage: dict | None) -> None:
+    if not isinstance(usage, dict):
+        return
+    for key in _SDK_USAGE_KEYS:
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            totals[key] = totals.get(key, 0) + value
+
+
+class RunState:
+    """Mutable accumulator for one query run.
+
+    Lives at module scope and is mutated as messages stream in, so a mid-stream failure
+    (e.g. the SDK raising when ``max_budget_usd`` is exceeded, before any ResultMessage is
+    emitted) still leaves the partial output / usage / turn data available to the error
+    envelope — otherwise cost and token metrics for an aborted run would be lost.
+
+    ``reset()`` runs at the start of every ``collect_messages`` call so the resume-then-fresh
+    retry (a failed session resume falling back to a fresh run) can never double-count.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.text_blocks: list[str] = []
+        self.tool_uses: list[dict] = []
+        self.models_seen: set[str] = set()
+        self.result_message: ResultMessage | None = None
+        self.turn_count: int = 0
+        self.usage_totals: dict[str, int] = {}
+        self.model_usage: dict[str, dict[str, int]] = {}
+
+    def record_assistant_usage(self, model: str | None, usage: dict | None) -> None:
+        _add_usage(self.usage_totals, usage)
+        if model:
+            _add_usage(self.model_usage.setdefault(model, {}), usage)
+
+    def final_usage(self) -> dict:
+        """Authoritative ResultMessage usage when present, else the per-turn accumulation."""
+        return extract_usage(self.result_message) or self.usage_totals
+
+    def model_usage_envelope(self) -> dict | None:
+        """Per-model token totals keyed by the envelope's field names, or None when empty."""
+        if not self.model_usage:
+            return None
+        return {
+            model: {env: totals.get(sdk, 0) for sdk, env in _ENVELOPE_USAGE_KEYS.items()}
+            for model, totals in self.model_usage.items()
+        }
+
+
+# Module-level so the top-level error handler can still read partial state after an abort.
+_run = RunState()
+
+
+async def collect_messages(prompt: str, options: ClaudeAgentOptions) -> None:
+    """Runs one query, accumulating output / tool uses / usage into the module-level `_run`.
+
+    Mutates shared state (rather than returning a dict) so that if the stream raises
+    mid-run — e.g. the SDK aborting on a budget cap before any ResultMessage — the partial
+    usage and turn data survive for the caller's error envelope. Resets `_run` first so a
+    resume-then-fresh retry never double-counts.
+    """
+    _run.reset()
 
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
-            turn_count += 1
-            log(f"[turn {turn_count}] assistant")
-            process_assistant_message(message, text_blocks, tool_uses, models_seen)
+            _run.turn_count += 1
+            log(f"[turn {_run.turn_count}] assistant")
+            process_assistant_message(message, _run.text_blocks, _run.tool_uses, _run.models_seen)
+            _run.record_assistant_usage(getattr(message, "model", None), getattr(message, "usage", None))
 
         elif isinstance(message, UserMessage):
-            log(f"[turn {turn_count}] tool_result")
+            log(f"[turn {_run.turn_count}] tool_result")
             process_user_message(message)
 
         elif isinstance(message, SystemMessage):
@@ -167,17 +252,9 @@ async def collect_messages(prompt: str, options: ClaudeAgentOptions) -> dict:
             process_system_message(message)
 
         elif isinstance(message, ResultMessage):
-            result_message = message
+            _run.result_message = message
             log_separator("Result")
             process_result_message(message)
-
-    return {
-        "text_blocks": text_blocks,
-        "tool_uses": tool_uses,
-        "models_seen": models_seen,
-        "result_message": result_message,
-        "turn_count": turn_count,
-    }
 
 
 def plugin_names(plugins: list[dict]) -> list[str]:
@@ -347,11 +424,16 @@ def build_output(
     error: str | None = None,
     error_traceback: str | None = None,
     models: list[str] | None = None,
+    model_usage: dict | None = None,
 ) -> dict:
     """
     Consistent JSON envelope for both success and error cases.
     The C# consumer reads: status, result, cost_usd, session_id,
-    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens.
+    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model_usage.
+
+    Token/usage fields are populated on error envelopes too (e.g. a budget abort), so an
+    aborted run's metrics aren't lost. `model_usage` carries the per-model token split the
+    consumer uses to estimate cost when no authoritative `cost_usd` is available.
     """
     usage = usage or {}
     return {
@@ -369,6 +451,7 @@ def build_output(
         "output_tokens": usage.get("output_tokens"),
         "cache_read_tokens": usage.get("cache_read_input_tokens"),
         "cache_creation_tokens": usage.get("cache_creation_input_tokens"),
+        "model_usage": model_usage,
         "error": error,
         "error_traceback": error_traceback,
     }
@@ -454,42 +537,37 @@ async def main() -> None:
     if prior_sid:
         try:
             log(f"Resuming session {prior_sid}.")
-            collected = await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs, resume=prior_sid))
+            await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs, resume=prior_sid))
         except Exception as exc:  # noqa: BLE001 — resume must never harden into a hard failure
             log(f"WARNING: session resume failed ({type(exc).__name__}: {exc}) — retrying fresh.")
-            collected = await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs))
+            await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs))
     else:
-        collected = await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs))
-
-    text_blocks    = collected["text_blocks"]
-    tool_uses      = collected["tool_uses"]
-    models_seen    = collected["models_seen"]
-    result_message = collected["result_message"]
-    turn_count     = collected["turn_count"]
+        await collect_messages(prompt, ClaudeAgentOptions(**option_kwargs))
 
     if skey:
-        persist_session(skey, getattr(result_message, "session_id", None))
+        persist_session(skey, getattr(_run.result_message, "session_id", None))
 
     duration = time.monotonic() - _start_time
-    usage = extract_usage(result_message)
 
     log_separator("Summary")
-    log(f"turns={turn_count} text_blocks={len(text_blocks)} tool_uses={len(tool_uses)} duration={duration:.1f}s")
-    if models_seen:
-        log(f"models={sorted(models_seen)}")
+    log(f"turns={_run.turn_count} text_blocks={len(_run.text_blocks)} "
+        f"tool_uses={len(_run.tool_uses)} duration={duration:.1f}s")
+    if _run.models_seen:
+        log(f"models={sorted(_run.models_seen)}")
 
     emit(build_output(
         tenant_id=tenant_id,
         execution_id=execution_id,
         plugins=plugins,
         status="completed",
-        result="\n\n".join(text_blocks) if text_blocks else None,
-        tool_uses=tool_uses or None,
+        result="\n\n".join(_run.text_blocks) if _run.text_blocks else None,
+        tool_uses=_run.tool_uses or None,
         duration_seconds=duration,
-        cost_usd=getattr(result_message, "total_cost_usd", None),
-        session_id=getattr(result_message, "session_id", None),
-        usage=usage,
-        models=sorted(models_seen) if models_seen else None,
+        cost_usd=getattr(_run.result_message, "total_cost_usd", None),
+        session_id=getattr(_run.result_message, "session_id", None),
+        usage=_run.final_usage(),
+        models=sorted(_run.models_seen) if _run.models_seen else None,
+        model_usage=_run.model_usage_envelope(),
     ))
 
 
@@ -501,12 +579,22 @@ if __name__ == "__main__":
         log(f"fatal: {type(e).__name__}: {e} (after {duration:.1f}s)")
 
         plugins = parse_plugins(os.environ.get("CLAUDE_CODE_PLUGINS", "[]"))
+        # Carry whatever was accumulated before the abort (most importantly token usage when
+        # a budget cap is hit) so cost/token metrics survive into the error envelope instead
+        # of being reported as null.
         emit(build_output(
             tenant_id=os.environ.get("TENANT_ID", "unknown"),
             execution_id=os.environ.get("EXECUTION_ID", "unknown"),
             plugins=plugins,
             status="error",
+            result="\n\n".join(_run.text_blocks) if _run.text_blocks else None,
+            tool_uses=_run.tool_uses or None,
             duration_seconds=duration,
+            cost_usd=getattr(_run.result_message, "total_cost_usd", None),
+            session_id=getattr(_run.result_message, "session_id", None),
+            usage=_run.final_usage(),
+            models=sorted(_run.models_seen) if _run.models_seen else None,
+            model_usage=_run.model_usage_envelope(),
             error=f"{type(e).__name__}: {e}",
             error_traceback=traceback.format_exc(),
         ))

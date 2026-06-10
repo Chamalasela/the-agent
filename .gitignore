@@ -61,3 +61,8 @@ TheAgent/.env.production
 
 # Local History for Visual Studio
 *.lscache
+
+# Python (Executor/) bytecode caches
+__pycache__/
+*.py[cod]
+*$py.class

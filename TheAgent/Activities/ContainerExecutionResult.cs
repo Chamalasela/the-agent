@@ -29,4 +29,22 @@ public sealed class ContainerExecutionResult
     /// so model-tiering changes can be charted by the model that did the work.
     /// </summary>
     public IReadOnlyList<string>? Models { get; set; }
+
+    /// <summary>
+    /// Per-model token usage parsed from the executor's <c>model_usage</c> field. Populated
+    /// even for aborted runs (e.g. a budget cap hit before any authoritative cost arrived),
+    /// letting <see cref="Xianix.Workflows.ExecutionMetrics"/> estimate cost per model from
+    /// token counts when <see cref="CostUsd"/> is unavailable. Null when the executor didn't
+    /// report a breakdown.
+    /// </summary>
+    public IReadOnlyDictionary<string, ModelTokenUsage>? ModelUsage { get; set; }
+}
+
+/// <summary>Token usage for a single model within one container execution.</summary>
+public sealed record ModelTokenUsage
+{
+    public long? InputTokens         { get; init; }
+    public long? OutputTokens        { get; init; }
+    public long? CacheReadTokens     { get; init; }
+    public long? CacheCreationTokens { get; init; }
 }

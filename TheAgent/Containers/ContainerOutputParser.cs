@@ -35,6 +35,7 @@ public static class ContainerOutputParser
             result.SessionId           = GetString(root, "session_id");
             result.DurationSeconds     = GetDouble(root, "duration_seconds");
             result.Models              = GetStringArray(root, "models");
+            result.ModelUsage          = GetModelUsage(root);
         }
         catch (JsonException ex)
         {
@@ -74,6 +75,29 @@ public static class ContainerOutputParser
     private static string? GetString(JsonElement root, string prop)
         => root.TryGetProperty(prop, out var el) && el.ValueKind == JsonValueKind.String
             ? el.GetString() : null;
+
+    private static IReadOnlyDictionary<string, ModelTokenUsage>? GetModelUsage(JsonElement root)
+    {
+        if (!root.TryGetProperty("model_usage", out var el) || el.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var usage = new Dictionary<string, ModelTokenUsage>(StringComparer.Ordinal);
+        foreach (var model in el.EnumerateObject())
+        {
+            if (model.Value.ValueKind != JsonValueKind.Object || string.IsNullOrWhiteSpace(model.Name))
+                continue;
+
+            usage[model.Name] = new ModelTokenUsage
+            {
+                InputTokens         = GetLong(model.Value, "input_tokens"),
+                OutputTokens        = GetLong(model.Value, "output_tokens"),
+                CacheReadTokens     = GetLong(model.Value, "cache_read_tokens"),
+                CacheCreationTokens = GetLong(model.Value, "cache_creation_tokens"),
+            };
+        }
+
+        return usage.Count == 0 ? null : usage;
+    }
 
     private static IReadOnlyList<string>? GetStringArray(JsonElement root, string prop)
     {

@@ -66,10 +66,19 @@ internal static class ExecutionMetrics
         var succeeded = result.Succeeded ? 1 : 0;
         var failed    = result.Succeeded ? 0 : 1;
 
+        // Prefer the executor's authoritative cost. When it's missing — e.g. a run aborted on
+        // a budget cap before the SDK emitted a final cost — fall back to estimating from the
+        // per-model token usage so cost metrics aren't lost. Estimates are flagged so they're
+        // distinguishable from authoritative figures (mirrors the chat-conversation path).
+        var (costUsd, costEstimated) = ResolveCost(result);
+
+        var metadata = BuildMetadata(ctx, result);
+        metadata["cost_estimated"] = costEstimated ? "true" : "false";
+
         ContextAwareUsageReportBuilder builder = XiansContext.Metrics
             .ForModel(ModelName)
             .WithCustomIdentifier(ctx.CustomIdentifier)
-            .WithMetadata(BuildMetadata(ctx, result));
+            .WithMetadata(metadata);
 
         // ── Category-level totals (identical shape for every execution path) ──
         builder = builder
@@ -77,8 +86,8 @@ internal static class ExecutionMetrics
             .WithMetric(ctx.Category, "succeeded", succeeded, "count")
             .WithMetric(ctx.Category, "failed",    failed,    "count");
 
-        if (result.CostUsd.HasValue)
-            builder = builder.WithMetric(ctx.Category, "cost", result.CostUsd.Value, "usd");
+        if (costUsd.HasValue)
+            builder = builder.WithMetric(ctx.Category, "cost", costUsd.Value, "usd");
 
         if (result.DurationSeconds.HasValue)
             builder = builder.WithMetric(ctx.Category, "duration", result.DurationSeconds.Value, "seconds");
@@ -94,8 +103,8 @@ internal static class ExecutionMetrics
                 .WithMetric(ctx.Category, $"{block}.succeeded", succeeded, "count")
                 .WithMetric(ctx.Category, $"{block}.failed",    failed,    "count");
 
-            if (result.CostUsd.HasValue)
-                builder = builder.WithMetric(ctx.Category, $"{block}.cost", result.CostUsd.Value, "usd");
+            if (costUsd.HasValue)
+                builder = builder.WithMetric(ctx.Category, $"{block}.cost", costUsd.Value, "usd");
 
             if (result.DurationSeconds.HasValue)
                 builder = builder.WithMetric(ctx.Category, $"{block}.duration", result.DurationSeconds.Value, "seconds");
@@ -106,8 +115,14 @@ internal static class ExecutionMetrics
             builder = builder.WithMetric(PluginUsageCategory, plugin, 1, "count");
 
         // ── Shared cross-path totals (cost + tokens), same keys for every path ──
-        if (result.CostUsd.HasValue)
-            builder = builder.WithMetric("cost", "usd", result.CostUsd.Value, "usd");
+        // Estimated costs still roll into the grand total so total spend stays complete, and
+        // the estimated slice is also surfaced separately so a dashboard can flag/subtract it.
+        if (costUsd.HasValue)
+        {
+            builder = builder.WithMetric("cost", "usd", costUsd.Value, "usd");
+            if (costEstimated)
+                builder = builder.WithMetric("cost", "estimated_usd", costUsd.Value, "usd");
+        }
 
         if (result.InputTokens.HasValue)
             builder = builder.WithMetric("tokens", "input", result.InputTokens.Value, "tokens");
@@ -144,8 +159,21 @@ internal static class ExecutionMetrics
         foreach (var model in models.Where(m => !string.IsNullOrWhiteSpace(m)).Distinct(StringComparer.Ordinal))
             builder = builder.WithMetric(ModelUsageCategory, model, 1, "count");
 
-        if (result.CostUsd.HasValue && models.Count == 1)
-            builder = builder.WithMetric(ModelCostCategory, models[0], result.CostUsd.Value, "usd");
+        // Authoritative cost can only be attributed to a single model (the executor gives one
+        // total). An estimate is built per model, so attribute each model's own slice — that
+        // keeps the per-model cost chart populated for budget-aborted, multi-model runs too.
+        if (costEstimated && result.ModelUsage is { Count: > 0 } modelUsage)
+        {
+            foreach (var (model, usage) in modelUsage)
+            {
+                if (EstimateModelCost(model, usage) is { } modelCost)
+                    builder = builder.WithMetric(ModelCostCategory, model, modelCost, "usd");
+            }
+        }
+        else if (costUsd.HasValue && models.Count == 1)
+        {
+            builder = builder.WithMetric(ModelCostCategory, models[0], costUsd.Value, "usd");
+        }
 
         // ── Cost budget ──
         // When a per-execution spend cap is configured, surface the cap and whether this run
@@ -154,12 +182,44 @@ internal static class ExecutionMetrics
         if (ctx.MaxBudgetUsd is { } budget && budget > 0)
         {
             builder = builder.WithMetric(ctx.Category, "budget", budget, "usd");
-            var overBudget = result.CostUsd is { } cost && cost > budget ? 1 : 0;
+            var overBudget = costUsd is { } cost && cost > budget ? 1 : 0;
             builder = builder.WithMetric(ctx.Category, "over_budget", overBudget, "count");
         }
 
         return builder.ReportAsync();
     }
+
+    /// <summary>
+    /// Resolves the cost to report: the executor's authoritative <c>cost_usd</c> when present,
+    /// otherwise a best-effort estimate from per-model token usage (so a budget-aborted run,
+    /// which never reports an authoritative cost, still contributes a cost figure). The bool is
+    /// <see langword="true"/> when the returned cost is an estimate.
+    /// </summary>
+    private static (double? cost, bool estimated) ResolveCost(ContainerExecutionResult result)
+    {
+        if (result.CostUsd.HasValue)
+            return (result.CostUsd.Value, false);
+
+        if (result.ModelUsage is not { Count: > 0 } modelUsage)
+            return (null, false);
+
+        double total = 0;
+        var any = false;
+        foreach (var (model, usage) in modelUsage)
+        {
+            if (EstimateModelCost(model, usage) is { } cost)
+            {
+                total += cost;
+                any = true;
+            }
+        }
+
+        return any ? (total, true) : (null, false);
+    }
+
+    private static double? EstimateModelCost(string model, ModelTokenUsage usage) =>
+        ModelPricing.EstimateCostUsd(
+            model, usage.InputTokens, usage.OutputTokens, usage.CacheReadTokens, usage.CacheCreationTokens);
 
     /// <summary>
     /// Reports a single conversational supervisor turn — the Claude call that runs for
