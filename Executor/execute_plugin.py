@@ -480,7 +480,7 @@ async def main() -> None:
     max_turns        = parse_int_env("XIANIX_MAX_TURNS") or parse_int_env("XIANIX_DEFAULT_MAX_TURNS")
     allowed_tools    = parse_tool_list(os.environ.get("XIANIX_ALLOWED_TOOLS"))
     disallowed_tools = parse_tool_list(os.environ.get("XIANIX_DISALLOWED_TOOLS"))
-    max_budget_usd   = parse_float_env("XIANIX_MAX_BUDGET_USD")
+    max_budget_usd   = parse_float_env("XIANIX_MAX_BUDGET_USD") or 10.0
 
     # Route Claude Code's background/side-query work (titles, summaries, etc.) to a cheap
     # Haiku-class model unless the operator already pinned one. ANTHROPIC_DEFAULT_HAIKU_MODEL
